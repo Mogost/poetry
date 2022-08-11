@@ -1,31 +1,40 @@
+from __future__ import annotations
+
 import json
 import shutil
 
 from io import BytesIO
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
+from poetry.core.packages.dependency import Dependency
 from requests.exceptions import TooManyRedirects
 from requests.models import Response
 
-from poetry.core.packages import Dependency
+from poetry.factory import Factory
 from poetry.repositories.pypi_repository import PyPiRepository
-from poetry.utils._compat import PY35
-from poetry.utils._compat import Path
 from poetry.utils._compat import encode
 
 
-class MockRepository(PyPiRepository):
+if TYPE_CHECKING:
+    from pytest_mock import MockerFixture
 
+
+@pytest.fixture(autouse=True)
+def _use_simple_keyring(with_simple_keyring: None) -> None:
+    pass
+
+
+class MockRepository(PyPiRepository):
     JSON_FIXTURES = Path(__file__).parent / "fixtures" / "pypi.org" / "json"
     DIST_FIXTURES = Path(__file__).parent / "fixtures" / "pypi.org" / "dists"
 
-    def __init__(self, fallback=False):
-        super(MockRepository, self).__init__(
-            url="http://foo.bar", disable_cache=True, fallback=fallback
-        )
+    def __init__(self, fallback: bool = False) -> None:
+        super().__init__(url="http://foo.bar", disable_cache=True, fallback=fallback)
 
-    def _get(self, url):
+    def _get(self, url: str) -> dict | None:
         parts = url.split("/")[1:]
         name = parts[0]
         if len(parts) == 3:
@@ -46,7 +55,7 @@ class MockRepository(PyPiRepository):
         with fixture.open(encoding="utf-8") as f:
             return json.loads(f.read())
 
-    def _download(self, url, dest):
+    def _download(self, url: str, dest: Path) -> None:
         filename = url.split("/")[-1]
 
         fixture = self.DIST_FIXTURES / filename
@@ -56,23 +65,33 @@ class MockRepository(PyPiRepository):
 
 def test_find_packages():
     repo = MockRepository()
-    packages = repo.find_packages("requests", "^2.18")
+    packages = repo.find_packages(Factory.create_dependency("requests", "^2.18"))
 
     assert len(packages) == 5
 
 
 def test_find_packages_with_prereleases():
     repo = MockRepository()
-    packages = repo.find_packages("toga", ">=0.3.0.dev2")
+    packages = repo.find_packages(Factory.create_dependency("toga", ">=0.3.0.dev2"))
 
     assert len(packages) == 7
 
 
 def test_find_packages_does_not_select_prereleases_if_not_allowed():
     repo = MockRepository()
-    packages = repo.find_packages("pyyaml")
+    packages = repo.find_packages(Factory.create_dependency("pyyaml", "*"))
 
     assert len(packages) == 1
+
+
+@pytest.mark.parametrize(
+    ["constraint", "count"], [("*", 1), (">=1", 0), (">=19.0.0a0", 1)]
+)
+def test_find_packages_only_prereleases(constraint: str, count: int):
+    repo = MockRepository()
+    packages = repo.find_packages(Factory.create_dependency("black", constraint))
+
+    assert len(packages) == count
 
 
 def test_package():
@@ -81,16 +100,29 @@ def test_package():
     package = repo.package("requests", "2.18.4")
 
     assert package.name == "requests"
-    assert len(package.requires) == 4
+    assert len(package.requires) == 9
+    assert len([r for r in package.requires if r.is_optional()]) == 5
     assert len(package.extras["security"]) == 3
     assert len(package.extras["socks"]) == 2
+
+    assert package.files == [
+        {
+            "file": "requests-2.18.4-py2.py3-none-any.whl",
+            "hash": "sha256:6a1b267aa90cac58ac3a765d067950e7dbbf75b1da07e895d1f594193a40a38b",  # noqa: E501
+        },
+        {
+            "file": "requests-2.18.4.tar.gz",
+            "hash": "sha256:9c443e7324ba5b85070c4a818ade28bfabedf16ea10206da1132edaa6dda237e",  # noqa: E501
+        },
+    ]
 
     win_inet = package.extras["socks"][0]
     assert win_inet.name == "win-inet-pton"
     assert win_inet.python_versions == "~2.7 || ~2.6"
-    assert str(win_inet.marker) == (
-        'sys_platform == "win32" and (python_version == "2.7" '
-        'or python_version == "2.6") and extra == "socks"'
+    assert (
+        str(win_inet.marker)
+        == 'sys_platform == "win32" and (python_version == "2.7"'
+        ' or python_version == "2.6") and extra == "socks"'
     )
 
 
@@ -102,7 +134,7 @@ def test_fallback_on_downloading_packages():
     assert package.name == "jupyter"
     assert len(package.requires) == 6
 
-    dependency_names = sorted([dep.name for dep in package.requires])
+    dependency_names = sorted(dep.name for dep in package.requires)
     assert dependency_names == [
         "ipykernel",
         "ipywidgets",
@@ -126,14 +158,14 @@ def test_fallback_inspects_sdist_first_if_no_matching_wheels_can_be_found():
     assert dep.python_versions == "~2.7"
 
 
-@pytest.mark.skipif(not PY35, reason="AST parsing does not work for Python <3.4")
 def test_fallback_can_read_setup_to_get_dependencies():
     repo = MockRepository(fallback=True)
 
     package = repo.package("sqlalchemy", "1.2.12")
 
     assert package.name == "sqlalchemy"
-    assert len(package.requires) == 0
+    assert len(package.requires) == 9
+    assert len([r for r in package.requires if r.is_optional()]) == 9
 
     assert package.extras == {
         "mssql_pymssql": [Dependency("pymssql", "*")],
@@ -154,7 +186,10 @@ def test_pypi_repository_supports_reading_bz2_files():
     package = repo.package("twisted", "18.9.0")
 
     assert package.name == "twisted"
-    assert sorted(package.requires, key=lambda r: r.name) == [
+    assert len(package.requires) == 71
+    assert sorted(
+        (r for r in package.requires if not r.is_optional()), key=lambda r: r.name
+    ) == [
         Dependency("attrs", ">=17.4.0"),
         Dependency("Automat", ">=0.3.0"),
         Dependency("constantly", ">=15.1"),
@@ -179,9 +214,9 @@ def test_pypi_repository_supports_reading_bz2_files():
         ]
     }
 
-    for name, deps in expected_extras.items():
-        assert expected_extras[name] == sorted(
-            package.extras[name], key=lambda r: r.name
+    for name in expected_extras.keys():
+        assert (
+            sorted(package.extras[name], key=lambda r: r.name) == expected_extras[name]
         )
 
 
@@ -190,18 +225,19 @@ def test_invalid_versions_ignored():
 
     # the json metadata for this package contains one malformed version
     # and a correct one.
-    packages = repo.find_packages("pygame-music-grid")
+    packages = repo.find_packages(Factory.create_dependency("pygame-music-grid", "*"))
     assert len(packages) == 1
 
 
-def test_get_should_invalid_cache_on_too_many_redirects_error(mocker):
+def test_get_should_invalid_cache_on_too_many_redirects_error(mocker: MockerFixture):
     delete_cache = mocker.patch("cachecontrol.caches.file_cache.FileCache.delete")
 
     response = Response()
+    response.status_code = 200
     response.encoding = "utf-8"
     response.raw = BytesIO(encode('{"foo": "bar"}'))
     mocker.patch(
-        "cachecontrol.adapter.CacheControlAdapter.send",
+        "poetry.utils.authenticator.Authenticator.get",
         side_effect=[TooManyRedirects(), response],
     )
     repository = PyPiRepository()
@@ -213,13 +249,13 @@ def test_get_should_invalid_cache_on_too_many_redirects_error(mocker):
 def test_urls():
     repository = PyPiRepository()
 
-    assert "https://pypi.org/simple/" == repository.url
-    assert "https://pypi.org/simple/" == repository.authenticated_url
+    assert repository.url == "https://pypi.org/simple/"
+    assert repository.authenticated_url == "https://pypi.org/simple/"
 
 
 def test_use_pypi_pretty_name():
     repo = MockRepository(fallback=True)
 
-    package = repo.find_packages("twisted")
+    package = repo.find_packages(Factory.create_dependency("twisted", "*"))
     assert len(package) == 1
     assert package[0].pretty_name == "Twisted"

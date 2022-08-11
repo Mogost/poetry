@@ -1,9 +1,24 @@
-from ..helpers import add_to_repo
-from ..helpers import check_solver_result
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from poetry.factory import Factory
+from tests.mixology.helpers import add_to_repo
+from tests.mixology.helpers import check_solver_result
 
 
-def test_no_version_matching_constraint(root, provider, repo):
-    root.add_dependency("foo", "^1.0")
+if TYPE_CHECKING:
+    from poetry.core.packages.project_package import ProjectPackage
+
+    from poetry.repositories import Repository
+    from tests.mixology.version_solver.conftest import Provider
+
+
+def test_no_version_matching_constraint(
+    root: ProjectPackage, provider: Provider, repo: Repository
+):
+    root.add_dependency(Factory.create_dependency("foo", "^1.0"))
 
     add_to_repo(repo, "foo", "2.0.0")
     add_to_repo(repo, "foo", "2.1.3")
@@ -18,9 +33,11 @@ def test_no_version_matching_constraint(root, provider, repo):
     )
 
 
-def test_no_version_that_matches_combined_constraints(root, provider, repo):
-    root.add_dependency("foo", "1.0.0")
-    root.add_dependency("bar", "1.0.0")
+def test_no_version_that_matches_combined_constraints(
+    root: ProjectPackage, provider: Provider, repo: Repository
+):
+    root.add_dependency(Factory.create_dependency("foo", "1.0.0"))
+    root.add_dependency(Factory.create_dependency("bar", "1.0.0"))
 
     add_to_repo(repo, "foo", "1.0.0", deps={"shared": ">=2.0.0 <3.0.0"})
     add_to_repo(repo, "bar", "1.0.0", deps={"shared": ">=2.9.0 <4.0.0"})
@@ -29,16 +46,21 @@ def test_no_version_that_matches_combined_constraints(root, provider, repo):
 
     error = """\
 Because foo (1.0.0) depends on shared (>=2.0.0 <3.0.0)
- and no versions of shared match >=2.9.0,<3.0.0, foo (1.0.0) requires shared (>=2.0.0,<2.9.0).
-And because bar (1.0.0) depends on shared (>=2.9.0 <4.0.0), bar (1.0.0) is incompatible with foo (1.0.0).
-So, because myapp depends on both foo (1.0.0) and bar (1.0.0), version solving failed."""
+ and no versions of shared match >=2.9.0,<3.0.0,\
+ foo (1.0.0) requires shared (>=2.0.0,<2.9.0).
+And because bar (1.0.0) depends on shared (>=2.9.0 <4.0.0),\
+ bar (1.0.0) is incompatible with foo (1.0.0).
+So, because myapp depends on both foo (1.0.0) and bar (1.0.0), version solving failed.\
+"""
 
     check_solver_result(root, provider, error=error)
 
 
-def test_disjoint_constraints(root, provider, repo):
-    root.add_dependency("foo", "1.0.0")
-    root.add_dependency("bar", "1.0.0")
+def test_disjoint_constraints(
+    root: ProjectPackage, provider: Provider, repo: Repository
+):
+    root.add_dependency(Factory.create_dependency("foo", "1.0.0"))
+    root.add_dependency(Factory.create_dependency("bar", "1.0.0"))
 
     add_to_repo(repo, "foo", "1.0.0", deps={"shared": "<=2.0.0"})
     add_to_repo(repo, "bar", "1.0.0", deps={"shared": ">3.0.0"})
@@ -47,16 +69,20 @@ def test_disjoint_constraints(root, provider, repo):
 
     error = """\
 Because bar (1.0.0) depends on shared (>3.0.0)
- and foo (1.0.0) depends on shared (<=2.0.0), bar (1.0.0) is incompatible with foo (1.0.0).
-So, because myapp depends on both foo (1.0.0) and bar (1.0.0), version solving failed."""
+ and foo (1.0.0) depends on shared (<=2.0.0),\
+ bar (1.0.0) is incompatible with foo (1.0.0).
+So, because myapp depends on both foo (1.0.0) and bar (1.0.0), version solving failed.\
+"""
 
     check_solver_result(root, provider, error=error)
     check_solver_result(root, provider, error=error)
 
 
-def test_disjoint_root_constraints(root, provider, repo):
-    root.add_dependency("foo", "1.0.0")
-    root.add_dependency("foo", "2.0.0")
+def test_disjoint_root_constraints(
+    root: ProjectPackage, provider: Provider, repo: Repository
+):
+    root.add_dependency(Factory.create_dependency("foo", "1.0.0"))
+    root.add_dependency(Factory.create_dependency("foo", "2.0.0"))
 
     add_to_repo(repo, "foo", "1.0.0")
     add_to_repo(repo, "foo", "2.0.0")
@@ -67,9 +93,28 @@ Because myapp depends on both foo (1.0.0) and foo (2.0.0), version solving faile
     check_solver_result(root, provider, error=error)
 
 
-def test_no_valid_solution(root, provider, repo):
-    root.add_dependency("a")
-    root.add_dependency("b")
+def test_disjoint_root_constraints_path_dependencies(
+    root: ProjectPackage, provider: Provider, repo: Repository
+):
+    provider.set_package_python_versions("^3.7")
+    fixtures = Path(__file__).parent.parent.parent / "fixtures"
+    project_dir = fixtures.joinpath("with_conditional_path_deps")
+    dependency1 = Factory.create_dependency("demo", {"path": project_dir / "demo_one"})
+    root.add_dependency(dependency1)
+    dependency2 = Factory.create_dependency("demo", {"path": project_dir / "demo_two"})
+    root.add_dependency(dependency2)
+
+    error = (
+        f"Because myapp depends on both {str(dependency1).replace('*', '1.2.3')} "
+        f"and {str(dependency2).replace('*', '1.2.3')}, version solving failed."
+    )
+
+    check_solver_result(root, provider, error=error)
+
+
+def test_no_valid_solution(root: ProjectPackage, provider: Provider, repo: Repository):
+    root.add_dependency(Factory.create_dependency("a", "*"))
+    root.add_dependency(Factory.create_dependency("b", "*"))
 
     add_to_repo(repo, "a", "1.0.0", deps={"b": "1.0.0"})
     add_to_repo(repo, "a", "2.0.0", deps={"b": "2.0.0"})
@@ -86,3 +131,13 @@ Thus, b is forbidden.
 So, because myapp depends on b (*), version solving failed."""
 
     check_solver_result(root, provider, error=error, tries=2)
+
+
+def test_package_with_the_same_name_gives_clear_error_message(
+    root: ProjectPackage, provider: Provider, repo: Repository
+):
+    pkg_name = "a"
+    root.add_dependency(Factory.create_dependency(pkg_name, "*"))
+    add_to_repo(repo, pkg_name, "1.0.0", deps={pkg_name: "1.0.0"})
+    error = f"Package '{pkg_name}' is listed as a dependency of itself."
+    check_solver_result(root, provider, error=error)
