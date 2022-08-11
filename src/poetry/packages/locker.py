@@ -60,6 +60,7 @@ class Locker:
         self._local_config = local_config
         self._lock_data: TOMLDocument | None = None
         self._content_hash = self._get_content_hash()
+        self._write_hash = not local_config.get('no_hash', False)
 
     @property
     def lock(self) -> TOMLFile:
@@ -412,6 +413,9 @@ class Locker:
             "content-hash": self._content_hash,
             "files": files,
         }
+
+        if not self._write_hash:
+            del lock["metadata"]["content-hash"]
 
         if not self.is_locked() or lock != self.lock_data:
             self._write_lock_data(lock)
