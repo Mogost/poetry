@@ -6,13 +6,13 @@ import re
 from contextlib import suppress
 from importlib import import_module
 from typing import TYPE_CHECKING
-from typing import Any
 from typing import cast
 
 from cleo.application import Application as BaseApplication
+from cleo.events.console_command_event import ConsoleCommandEvent
 from cleo.events.console_events import COMMAND
 from cleo.events.event_dispatcher import EventDispatcher
-from cleo.exceptions import CleoException
+from cleo.exceptions import CleoError
 from cleo.formatters.style import Style
 from cleo.io.null_io import NullIO
 
@@ -24,7 +24,7 @@ from poetry.console.commands.command import Command
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from cleo.events.console_command_event import ConsoleCommandEvent
+    from cleo.events.event import Event
     from cleo.io.inputs.argv_input import ArgvInput
     from cleo.io.inputs.definition import Definition
     from cleo.io.inputs.input import Input
@@ -78,10 +78,6 @@ COMMANDS = [
     "env list",
     "env remove",
     "env use",
-    # Plugin commands
-    "plugin add",
-    "plugin remove",
-    "plugin show",
     # Self commands
     "self add",
     "self install",
@@ -97,7 +93,7 @@ COMMANDS = [
 ]
 
 
-class Application(BaseApplication):  # type: ignore[misc]
+class Application(BaseApplication):
     def __init__(self) -> None:
         super().__init__("poetry", __version__)
 
@@ -125,8 +121,13 @@ class Application(BaseApplication):  # type: ignore[misc]
         if self._poetry is not None:
             return self._poetry
 
+        project_path = Path.cwd()
+
+        if self._io and self._io.input.option("directory"):
+            project_path = self._io.input.option("directory")
+
         self._poetry = Factory().create_poetry(
-            Path.cwd(),
+            cwd=project_path,
             io=self._io,
             disable_plugins=self._disable_plugins,
             disable_cache=self._disable_cache,
@@ -136,8 +137,8 @@ class Application(BaseApplication):  # type: ignore[misc]
 
     @property
     def command_loader(self) -> CommandLoader:
-        command_loader: CommandLoader | None = self._command_loader
-        assert command_loader is not None
+        command_loader = self._command_loader
+        assert isinstance(command_loader, CommandLoader)
         return command_loader
 
     def reset_poetry(self) -> None:
@@ -187,13 +188,25 @@ class Application(BaseApplication):  # type: ignore[misc]
         self._load_plugins(io)
 
         exit_code: int = super()._run(io)
+
+        import os
+
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            io.write_line(
+                "<warning>"
+                "The Poetry project has renamed the <b>master</> branch to <b>main</>. The use of the <b>master</> "
+                "branch is now deprecated and the branch will be removed in the near future. Please update your refs "
+                "to use <b>main</> branch instead. Alternatively consider using released versions."
+                "</>"
+            )
+
         return exit_code
 
     def _configure_io(self, io: IO) -> None:
         # We need to check if the command being run
         # is the "run" command.
         definition = self.definition
-        with suppress(CleoException):
+        with suppress(CleoError):
             io.input.bind(definition)
 
         name = io.input.first_argument
@@ -201,7 +214,7 @@ class Application(BaseApplication):  # type: ignore[misc]
             from poetry.console.io.inputs.run_argv_input import RunArgvInput
 
             input = cast("ArgvInput", io.input)
-            run_input = RunArgvInput([self._name or ""] + input._tokens)
+            run_input = RunArgvInput([self._name or "", *input._tokens])
             # For the run command reset the definition
             # with only the set options (i.e. the options given before the command)
             for option_name, value in input.options.items():
@@ -214,7 +227,7 @@ class Application(BaseApplication):  # type: ignore[misc]
                         for shortcut in shortcuts:
                             run_input.add_parameter_option("-" + shortcut.lstrip("-"))
 
-            with suppress(CleoException):
+            with suppress(CleoError):
                 run_input.bind(definition)
 
             for option_name, value in input.options.items():
@@ -226,12 +239,13 @@ class Application(BaseApplication):  # type: ignore[misc]
         super()._configure_io(io)
 
     def register_command_loggers(
-        self, event: ConsoleCommandEvent, event_name: str, _: Any
+        self, event: Event, event_name: str, _: EventDispatcher
     ) -> None:
         from poetry.console.logging.filters import POETRY_FILTER
         from poetry.console.logging.io_formatter import IOFormatter
         from poetry.console.logging.io_handler import IOHandler
 
+        assert isinstance(event, ConsoleCommandEvent)
         command = event.command
         if not isinstance(command, Command):
             return
@@ -276,16 +290,16 @@ class Application(BaseApplication):  # type: ignore[misc]
 
             logger.setLevel(_level)
 
-    def configure_env(
-        self, event: ConsoleCommandEvent, event_name: str, _: Any
-    ) -> None:
+    def configure_env(self, event: Event, event_name: str, _: EventDispatcher) -> None:
         from poetry.console.commands.env_command import EnvCommand
+        from poetry.console.commands.self.self_command import SelfCommand
 
+        assert isinstance(event, ConsoleCommandEvent)
         command = event.command
-        if not isinstance(command, EnvCommand):
+        if not isinstance(command, EnvCommand) or isinstance(command, SelfCommand):
             return
 
-        if command.env is not None:
+        if command._env is not None:
             return
 
         from poetry.utils.env import EnvManager
@@ -293,8 +307,8 @@ class Application(BaseApplication):  # type: ignore[misc]
         io = event.io
         poetry = command.poetry
 
-        env_manager = EnvManager(poetry)
-        env = env_manager.create_venv(io)
+        env_manager = EnvManager(poetry, io=io)
+        env = env_manager.create_venv()
 
         if env.is_venv() and io.is_verbose():
             io.write_line(f"Using virtualenv: <comment>{env.path}</>")
@@ -303,17 +317,18 @@ class Application(BaseApplication):  # type: ignore[misc]
 
     @classmethod
     def configure_installer_for_event(
-        cls, event: ConsoleCommandEvent, event_name: str, _: Any
+        cls, event: Event, event_name: str, _: EventDispatcher
     ) -> None:
         from poetry.console.commands.installer_command import InstallerCommand
 
+        assert isinstance(event, ConsoleCommandEvent)
         command = event.command
         if not isinstance(command, InstallerCommand):
             return
 
         # If the command already has an installer
         # we skip this step
-        if command.installer is not None:
+        if command._installer is not None:
             return
 
         cls.configure_installer_for_command(command, event.io)
@@ -330,8 +345,8 @@ class Application(BaseApplication):  # type: ignore[misc]
             poetry.locker,
             poetry.pool,
             poetry.config,
+            disable_cache=poetry.disable_cache,
         )
-        installer.use_executor(poetry.config.get("experimental.new-installer", False))
         command.set_installer(installer)
 
     def _load_plugins(self, io: IO | None = None) -> None:
@@ -351,6 +366,12 @@ class Application(BaseApplication):  # type: ignore[misc]
             manager.load_plugins()
             manager.activate(self)
 
+            # We have to override the command from poetry-plugin-export
+            # with the wrapper.
+            if self.command_loader.has("export"):
+                del self.command_loader._factories["export"]
+            self.command_loader._factories["export"] = load_command("export")
+
         self._plugins_loaded = True
 
     @property
@@ -369,6 +390,18 @@ class Application(BaseApplication):  # type: ignore[misc]
             )
         )
 
+        definition.add_option(
+            Option(
+                "--directory",
+                "-C",
+                flag=False,
+                description=(
+                    "The working directory for the Poetry command (defaults to the"
+                    " current working directory)."
+                ),
+            )
+        )
+
         return definition
 
     def _get_solution_provider_repository(self) -> SolutionProviderRepository:
@@ -376,7 +409,7 @@ class Application(BaseApplication):  # type: ignore[misc]
             SolutionProviderRepository,
         )
 
-        from poetry.mixology.solutions.providers.python_requirement_solution_provider import (  # noqa: E501
+        from poetry.mixology.solutions.providers.python_requirement_solution_provider import (
             PythonRequirementSolutionProvider,
         )
 

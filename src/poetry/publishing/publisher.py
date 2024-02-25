@@ -23,11 +23,11 @@ class Publisher:
     Registers and publishes packages to remote repositories.
     """
 
-    def __init__(self, poetry: Poetry, io: IO) -> None:
+    def __init__(self, poetry: Poetry, io: IO, dist_dir: Path | None = None) -> None:
         self._poetry = poetry
         self._package = poetry.package
         self._io = io
-        self._uploader = Uploader(poetry, io)
+        self._uploader = Uploader(poetry, io, dist_dir)
         self._authenticator = Authenticator(poetry.config, self._io)
 
     @property
@@ -57,14 +57,14 @@ class Publisher:
             # Check if we have a token first
             token = self._authenticator.get_pypi_token(repository_name)
             if token:
-                logger.debug(f"Found an API token for {repository_name}.")
+                logger.debug("Found an API token for %s.", repository_name)
                 username = "__token__"
                 password = token
             else:
                 auth = self._authenticator.get_http_auth(repository_name)
                 if auth:
                     logger.debug(
-                        f"Found authentication information for {repository_name}."
+                        "Found authentication information for %s.", repository_name
                     )
                     username = auth.username
                     password = auth.password

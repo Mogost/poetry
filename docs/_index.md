@@ -18,23 +18,99 @@ Poetry offers a lockfile to ensure repeatable installs, and can build your proje
 
 ## System requirements
 
-Poetry requires **Python 3.7+**. It is multi-platform and the goal is to make it work equally well
+Poetry requires **Python 3.8+**. It is multi-platform and the goal is to make it work equally well
 on Linux, macOS and Windows.
 
 ## Installation
+
+{{% warning %}}
+Poetry should always be installed in a dedicated virtual environment to isolate it from the rest of your system.
+It should in no case be installed in the environment of the project that is to be managed by Poetry.
+This ensures that Poetry's own dependencies will not be accidentally upgraded or uninstalled.
+(Each of the following installation methods ensures that Poetry is installed into an isolated environment.)
+In addition, the isolated virtual environment in which poetry is installed should not be activated for running poetry commands.
+{{% /warning %}}
 
 {{% note %}}
 If you are viewing documentation for the development branch, you may wish to install a preview or development version of Poetry.
 See the **advanced** installation instructions to use a preview or alternate version of Poetry.
 {{% /note %}}
 
-{{< tabs tabTotal="3" tabID1="installing-with-the-official-installer" tabID2="installing-with-pipx" tabID3="installing-manually" tabName1="With the official installer" tabName2="With pipx" tabName3="Manually (advanced)" >}}
+{{< tabs tabTotal="4" tabID1="installing-with-pipx" tabID2="installing-with-the-official-installer" tabID3="installing-manually" tabID4="ci-recommendations" tabName1="With pipx" tabName2="With the official installer" tabName3="Manually (advanced)" tabName4="CI recommendations">}}
 
+{{< tab tabID="installing-with-pipx" >}}
+
+[`pipx`](https://github.com/pypa/pipx) is used to install Python CLI applications globally while still isolating them in virtual environments.
+`pipx` will manage upgrades and uninstalls when used to install Poetry.
+
+{{< steps >}}
+{{< step >}}
+**Install pipx**
+
+If `pipx` is not already installed, you can follow any of the options in the
+[official pipx installation instructions](https://pipx.pypa.io/stable/installation/).
+Any non-ancient version of `pipx` will do.
+
+{{< /step >}}
+{{< step >}}
+**Install Poetry**
+
+```bash
+pipx install poetry
+```
+{{< /step >}}
+{{< step >}}
+**Install Poetry (advanced)**
+
+`pipx` can install different versions of Poetry, using the same syntax as pip:
+
+```bash
+pipx install poetry==1.2.0
+```
+
+`pipx` can also install versions of Poetry in parallel, which allows for easy testing of alternate or prerelease
+versions. Each version is given a unique, user-specified suffix, which will be used to create a unique binary name:
+
+```bash
+pipx install --suffix=@1.2.0 poetry==1.2.0
+poetry@1.2.0 --version
+```
+
+```bash
+pipx install --suffix=@preview --pip-args=--pre poetry
+poetry@preview --version
+```
+
+Finally, `pipx` can install any valid [pip requirement spec](https://pip.pypa.io/en/stable/cli/pip_install/), which
+allows for installations of the development version from `git`, or even for local testing of pull requests:
+
+```bash
+pipx install --suffix @master git+https://github.com/python-poetry/poetry.git@master
+pipx install --suffix @pr1234 git+https://github.com/python-poetry/poetry.git@refs/pull/1234/head
+```
+
+{{< /step >}}
+{{< step >}}
+**Update Poetry**
+
+```bash
+pipx upgrade poetry
+```
+{{< /step >}}
+{{< step >}}
+**Uninstall Poetry**
+
+```bash
+pipx uninstall poetry
+```
+{{< /step >}}
+{{< /steps >}}
+
+{{< /tab >}}
 {{< tab tabID="installing-with-the-official-installer" >}}
 
-We provide a custom installer that will install Poetry in a new virtual environment to isolate it
-from the rest of your system. This ensures that dependencies will not be accidentally upgraded or
-uninstalled, and allows Poetry to manage its own environment.
+We provide a custom installer that will install Poetry in a new virtual environment
+and allows Poetry to manage its own environment.
 
 {{< steps >}}
 {{< step >}}
@@ -46,9 +122,8 @@ The script can be executed directly (i.e. 'curl python') or downloaded and then 
 (e.g. in a CI environment).
 
 {{% warning %}}
-The previous `get-poetry.py` and `install-poetry.py` installers are deprecated. Any installs performed
-using `get-poetry.py` should be uninstalled and reinstalled using `install.python-poetry.org` to ensure
-in-place upgrades are possible.
+The `install-poetry.py` installer has been deprecated and removed from the Poetry repository.
+Please migrate from the in-tree version to the standalone version described above.
 {{% /warning %}}
 
 **Linux, macOS, Windows (WSL)**
@@ -88,7 +163,7 @@ If you wish to change this, you may define the `$POETRY_HOME` environment variab
 curl -sSL https://install.python-poetry.org | POETRY_HOME=/etc/poetry python3 -
 ```
 
-If you want to install prerelease versions, you can do so by passing `--preview` option to `install-poetry.py`
+If you want to install prerelease versions, you can do so by passing the `--preview` option to the installation script
 or by using the `$POETRY_PREVIEW` environment variable:
 
 ```bash
@@ -109,6 +184,8 @@ You can also install Poetry from a `git` repository by using the `--git` option:
 ```bash
 curl -sSL https://install.python-poetry.org | python3 - --git https://github.com/python-poetry/poetry.git@master
 ````
+If you want to install different versions of Poetry in parallel, a good approach is the installation with pipx and suffix.
+
 {{< /step >}}
 {{< step >}}
 **Add Poetry to your PATH**
@@ -117,16 +194,17 @@ The installer creates a `poetry` wrapper in a well-known, platform-specific dire
 
 - `$HOME/.local/bin` on Unix.
 - `%APPDATA%\Python\Scripts` on Windows.
+- `$POETRY_HOME/bin` if `$POETRY_HOME` is set.
 
 If this directory is not present in your `$PATH`, you can add it in order to invoke Poetry
 as `poetry`.
 
 Alternatively, the full path to the `poetry` binary can always be used:
 
-- `$POETRY_HOME/bin/poetry` if `$POETRY_HOME` is set.
-- `~/Library/Application Support/pypoetry/bin/poetry` on MacOS.
-- `~/.local/share/pypoetry/bin/poetry` on Linux/Unix.
-- `%APPDATA%\pypoetry\Scripts\poetry` on Windows.
+- `~/Library/Application Support/pypoetry/venv/bin/poetry` on MacOS.
+- `~/.local/share/pypoetry/venv/bin/poetry` on Linux/Unix.
+- `%APPDATA%\pypoetry\venv\Scripts\poetry` on Windows.
+- `$POETRY_HOME/venv/bin/poetry` if `$POETRY_HOME` is set.
 
 {{< /step >}}
 {{< step >}}
@@ -144,6 +222,11 @@ If you see something like `Poetry (version 1.2.0)`, your install is ready to use
 **Update Poetry**
 
 Poetry is able to update itself when installed using the official installer.
+
+{{% warning %}}
+Especially on Windows, `self update` may be problematic
+so that a re-install with the installer should be preferred.
+{{% /warning %}}
 
 ```bash
 poetry self update
@@ -181,76 +264,15 @@ curl -sSL https://install.python-poetry.org | POETRY_UNINSTALL=1 python3 -
 ```
 
 {{% warning %}}
-If you installed using the deprecated `get-poetry.py` script, you should use it to uninstall instead:
+If you installed using the deprecated `get-poetry.py` script, you should remove the path it uses manually, e.g.
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python3 - --uninstall
+rm -rf "${POETRY_HOME:-~/.poetry}"
 ```
+
+Also remove ~/.poetry/bin from your `$PATH` in your shell configuration, if it is present.
 {{% /warning %}}
 
-{{< /step >}}
-{{< /steps >}}
-
-{{< /tab >}}
-{{< tab tabID="installing-with-pipx" >}}
-
-Using [`pipx`](https://github.com/pypa/pipx) to install Poetry is also possible and fully supported.
-
-`pipx` is used to install Python CLI applications globally while still isolating them in virtual environments.
-`pipx` will manage upgrades and uninstalls when used to install Poetry.
-
-{{< steps >}}
-{{< step >}}
-**Install Poetry**
-
-```bash
-pipx install poetry
-```
-{{< /step >}}
-{{< step >}}
-**Install Poetry (advanced)**
-
-`pipx` can be install different versions of Poetry, using the same syntax as pip:
-
-```bash
-pipx install poetry==1.2.0
-```
-
-`pipx` can also install versions of Poetry in parallel, which allows for easy testing of alternate or prerelease
-versions. Each version is given a unique, user-specified suffix, which will be used to create a unique binary name:
-
-```bash
-pipx install --suffix=@1.2.0 poetry==1.2.0
-poetry@1.2.0 --version
-```
-
-```bash
-pipx install --suffix=@preview --pip-args=--pre poetry
-poetry@preview --version
-```
-
-Finally, `pipx` can install any valid [pip requirement spec](https://pip.pypa.io/en/stable/cli/pip_install/), which
-allows for installations of the development version from `git`, or even for local testing of pull requests:
-
-```
-pipx install --suffix @master git+https://github.com/python-poetry/poetry.git@master
-pipx install --suffix @pr1234 git+https://github.com/python-poetry/poetry.git@refs/pull/1234/head
-
-```
-{{< /step >}}
-{{< step >}}
-**Update Poetry**
-
-```bash
-pipx upgrade poetry
-```
-{{< /step >}}
-{{< step >}}
-**Uninstall Poetry**
-
-```bash
-pipx uninstall poetry
-```
 {{< /step >}}
 {{< /steps >}}
 
@@ -274,7 +296,69 @@ Poetry will be available at `$VENV_PATH/bin/poetry` and can be invoked directly 
 To uninstall Poetry, simply delete the entire `$VENV_PATH` directory.
 
 {{< /tab >}}
+{{< tab tabID="ci-recommendations" >}}
+Unlike development environments, where making use of the latest tools is desirable, in a CI environment reproducibility
+should be made the priority. Here are some suggestions for installing Poetry in such an environment.
+
+**Version pinning**
+
+Whatever method you use, it is highly recommended to explicitly control the version of Poetry used, so that you are able
+to upgrade after performing your own validation. Each install method has a different syntax for setting the version that
+is used in the following examples.
+
+**Using pipx**
+
+Just as `pipx` is a powerful tool for development use, it is equally useful in a CI environment
+and should be one of your top choices for use of Poetry in CI.
+
+```bash
+pipx install poetry==1.2.0
+```
+
+**Using install.python-poetry.org**
+
+{{% note %}}
+The official installer script ([install.python-poetry.org](https://install.python-poetry.org)) offers a streamlined and
+simplified installation of Poetry, sufficient for developer use or for simple pipelines. However, in a CI environment
+the other two supported installation methods (pipx and manual) should be seriously considered.
+{{% /note %}}
+
+Downloading a copy of the installer script to a place accessible by your CI pipelines (or maintaining a copy of the
+[repository](https://github.com/python-poetry/install.python-poetry.org)) is strongly suggested, to ensure your
+pipeline's stability and to maintain control over what code is executed.
+
+By default, the installer will install to a user-specific directory. In more complex pipelines that may make accessing
+Poetry difficult (especially in cases like multi-stage container builds). It is highly suggested to make use of
+`$POETRY_HOME` when using the official installer in CI, as that way the exact paths can be controlled.
+
+```bash
+export POETRY_HOME=/opt/poetry
+python3 install-poetry.py --version 1.2.0
+$POETRY_HOME/bin/poetry --version
+```
+
+**Using pip (aka manually)**
+
+For maximum control in your CI environment, installation with `pip` is fully supported and something you should
+consider. While this requires more explicit commands and knowledge of Python packaging from you, it in return offers the
+best debugging experience, and leaves you subject to the fewest external tools.
+
+```bash
+export POETRY_HOME=/opt/poetry
+python3 -m venv $POETRY_HOME
+$POETRY_HOME/bin/pip install poetry==1.2.0
+$POETRY_HOME/bin/poetry --version
+```
+
+{{% note %}}
+If you install Poetry via `pip`, ensure you have Poetry installed into an isolated environment that is **not the same**
+as the target environment managed by Poetry. If Poetry and your project are installed into the same environment, Poetry
+is likely to upgrade or uninstall its own dependencies (causing hard-to-debug and understand errors).
+{{% /note %}}
+
+{{< /tab >}}
 {{< /tabs >}}
+
 
 
 ## Enable tab completion for Bash, Fish, or Zsh
@@ -293,7 +377,7 @@ poetry completions bash >> ~/.bash_completion
 #### Lazy-loaded
 
 ```bash
-poetry completions bash > ${XDG_DATA_HOME:~/.local/share}/bash_completion/completions/poetry
+poetry completions bash > ${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/poetry
 ```
 
 ### Fish

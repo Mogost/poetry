@@ -15,7 +15,12 @@ class EnvInfoCommand(Command):
     name = "env info"
     description = "Displays information about the current environment."
 
-    options = [option("path", "p", "Only display the environment's path.")]
+    options = [
+        option("path", "p", "Only display the environment's path."),
+        option(
+            "executable", "e", "Only display the environment's python executable path."
+        ),
+    ]
 
     def handle(self) -> int:
         from poetry.utils.env import EnvManager
@@ -30,6 +35,14 @@ class EnvInfoCommand(Command):
 
             return 0
 
+        if self.option("executable"):
+            if not env.is_venv():
+                return 1
+
+            self.line(str(env.python))
+
+            return 0
+
         self._display_complete_info(env)
         return 0
 
@@ -40,10 +53,14 @@ class EnvInfoCommand(Command):
         listing = [
             f"<info>Python</info>:         <comment>{env_python_version}</>",
             f"<info>Implementation</info>: <comment>{env.python_implementation}</>",
-            "<info>Path</info>:          "
-            f" <comment>{env.path if env.is_venv() else 'NA'}</>",
-            "<info>Executable</info>:    "
-            f" <comment>{env.python if env.is_venv() else 'NA'}</>",
+            (
+                "<info>Path</info>:          "
+                f" <comment>{env.path if env.is_venv() else 'NA'}</>"
+            ),
+            (
+                "<info>Executable</info>:    "
+                f" <comment>{env.python if env.is_venv() else 'NA'}</>"
+            ),
         ]
         if env.is_venv():
             listing.append(
@@ -54,17 +71,17 @@ class EnvInfoCommand(Command):
 
         self.line("")
 
-        system_env = env.parent_env
-        python = ".".join(str(v) for v in system_env.version_info[:3])
-        self.line("<b>System</b>")
+        base_env = env.parent_env
+        python = ".".join(str(v) for v in base_env.version_info[:3])
+        self.line("<b>Base</b>")
         self.line(
             "\n".join(
                 [
                     f"<info>Platform</info>:   <comment>{env.platform}</>",
                     f"<info>OS</info>:         <comment>{env.os}</>",
                     f"<info>Python</info>:     <comment>{python}</>",
-                    f"<info>Path</info>:       <comment>{system_env.path}</>",
-                    f"<info>Executable</info>: <comment>{system_env.python}</>",
+                    f"<info>Path</info>:       <comment>{base_env.path}</>",
+                    f"<info>Executable</info>: <comment>{base_env.python}</>",
                 ]
             )
         )

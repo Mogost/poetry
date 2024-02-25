@@ -13,15 +13,20 @@ from typing import TYPE_CHECKING
 from typing import Any
 
 import requests
+import requests.adapters
 import requests.auth
 import requests.exceptions
 
-from cachecontrol import CacheControl
+from cachecontrol import CacheControlAdapter
 from cachecontrol.caches import FileCache
+from requests_toolbelt import user_agent
 
+from poetry.__version__ import __version__
 from poetry.config.config import Config
 from poetry.exceptions import PoetryException
 from poetry.utils.constants import REQUESTS_TIMEOUT
+from poetry.utils.constants import RETRY_AFTER_HEADER
+from poetry.utils.constants import STATUS_FORCELIST
 from poetry.utils.password_manager import HTTPAuthCredential
 from poetry.utils.password_manager import PasswordManager
 
@@ -85,16 +90,14 @@ class AuthenticatorRepositoryConfig:
             **(password_manager.get_http_auth(self.name) or {})
         )
 
-        if credential.password is None:
+        if credential.password is not None:
+            return credential
+
+        if password_manager.use_keyring:
             # fallback to url and netloc based keyring entries
-            credential = password_manager.keyring.get_credential(
+            credential = password_manager.get_credential(
                 self.url, self.netloc, username=credential.username
             )
-
-            if credential.password is not None:
-                return HTTPAuthCredential(
-                    username=credential.username, password=credential.password
-                )
 
         return credential
 
@@ -106,23 +109,22 @@ class Authenticator:
         io: IO | None = None,
         cache_id: str | None = None,
         disable_cache: bool = False,
+        pool_size: int = requests.adapters.DEFAULT_POOLSIZE,
     ) -> None:
         self._config = config or Config.create()
         self._io = io
         self._sessions_for_netloc: dict[str, requests.Session] = {}
         self._credentials: dict[str, HTTPAuthCredential] = {}
         self._certs: dict[str, RepositoryCertificateConfig] = {}
-        self._configured_repositories: dict[
-            str, AuthenticatorRepositoryConfig
-        ] | None = None
+        self._configured_repositories: (
+            dict[str, AuthenticatorRepositoryConfig] | None
+        ) = None
         self._password_manager = PasswordManager(self._config)
         self._cache_control = (
             FileCache(
-                str(
-                    self._config.repository_cache_directory
-                    / (cache_id or "_default_cache")
-                    / "_http"
-                )
+                self._config.repository_cache_directory
+                / (cache_id or "_default_cache")
+                / "_http"
             )
             if not disable_cache
             else None
@@ -130,22 +132,23 @@ class Authenticator:
         self.get_repository_config_for_url = functools.lru_cache(maxsize=None)(
             self._get_repository_config_for_url
         )
-
-    @property
-    def cache(self) -> FileCache | None:
-        return self._cache_control
-
-    @property
-    def is_cached(self) -> bool:
-        return self._cache_control is not None
+        self._pool_size = pool_size
+        self._user_agent = user_agent("poetry", __version__)
 
     def create_session(self) -> requests.Session:
         session = requests.Session()
+        session.headers["User-Agent"] = self._user_agent
 
-        if not self.is_cached:
+        if self._cache_control is None:
             return session
 
-        session = CacheControl(sess=session, cache=self._cache_control)
+        adapter = CacheControlAdapter(
+            cache=self._cache_control,
+            pool_maxsize=self._pool_size,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
         return session
 
     def get_session(self, url: str | None = None) -> requests.Session:
@@ -171,7 +174,7 @@ class Authenticator:
         self.close()
 
     def delete_cache(self, url: str) -> None:
-        if self.is_cached:
+        if self._cache_control is not None:
             self._cache_control.delete(key=url)
 
     def authenticated_url(self, url: str) -> str:
@@ -191,7 +194,8 @@ class Authenticator:
     def request(
         self, method: str, url: str, raise_for_status: bool = True, **kwargs: Any
     ) -> requests.Response:
-        request = requests.Request(method, url)
+        headers = kwargs.get("headers")
+        request = requests.Request(method, url, headers=headers)
         credential = self.get_credentials_for_url(url)
 
         if credential.username is not None or credential.password is not None:
@@ -202,19 +206,19 @@ class Authenticator:
         session = self.get_session(url=url)
         prepared_request = session.prepare_request(request)
 
-        proxies = kwargs.get("proxies", {})
-        stream = kwargs.get("stream")
+        proxies: dict[str, str] = kwargs.get("proxies", {})
+        stream: bool | None = kwargs.get("stream")
 
         certs = self.get_certs_for_url(url)
-        verify = kwargs.get("verify") or certs.cert or certs.verify
-        cert = kwargs.get("cert") or certs.client_cert
+        verify: bool | str | Path = kwargs.get("verify") or certs.cert or certs.verify
+        cert: str | Path | None = kwargs.get("cert") or certs.client_cert
 
         if cert is not None:
             cert = str(cert)
 
         verify = str(verify) if isinstance(verify, Path) else verify
 
-        settings = session.merge_environment_settings(  # type: ignore[no-untyped-call]
+        settings = session.merge_environment_settings(
             prepared_request.url, proxies, stream, verify, cert
         )
 
@@ -226,6 +230,7 @@ class Authenticator:
         send_kwargs.update(settings)
 
         attempt = 0
+        resp = None
 
         while True:
             is_last_attempt = attempt >= 5
@@ -235,23 +240,35 @@ class Authenticator:
                 if is_last_attempt:
                     raise e
             else:
-                if resp.status_code not in [502, 503, 504] or is_last_attempt:
+                if resp.status_code not in STATUS_FORCELIST or is_last_attempt:
                     if raise_for_status:
                         resp.raise_for_status()
                     return resp
 
             if not is_last_attempt:
                 attempt += 1
-                delay = 0.5 * attempt
-                logger.debug(f"Retrying HTTP request in {delay} seconds.")
+                delay = self._get_backoff(resp, attempt)
+                logger.debug("Retrying HTTP request in %s seconds.", delay)
                 time.sleep(delay)
                 continue
 
         # this should never really be hit under any sane circumstance
         raise PoetryException("Failed HTTP {} request", method.upper())
 
+    def _get_backoff(self, response: requests.Response | None, attempt: int) -> float:
+        if response is not None:
+            retry_after = response.headers.get(RETRY_AFTER_HEADER, "")
+            if retry_after:
+                return float(retry_after)
+
+        return 0.5 * attempt
+
     def get(self, url: str, **kwargs: Any) -> requests.Response:
         return self.request("get", url, **kwargs)
+
+    def head(self, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("allow_redirects", False)
+        return self.request("head", url, **kwargs)
 
     def post(self, url: str, **kwargs: Any) -> requests.Response:
         return self.request("post", url, **kwargs)
@@ -284,7 +301,7 @@ class Authenticator:
         if credential.password is None:
             parsed_url = urllib.parse.urlsplit(url)
             netloc = parsed_url.netloc
-            credential = self._password_manager.keyring.get_credential(
+            credential = self._password_manager.get_credential(
                 url, netloc, username=credential.username
             )
 
@@ -362,9 +379,9 @@ class Authenticator:
             self._configured_repositories = {}
             for repository_name in self._config.get("repositories", []):
                 url = self._config.get(f"repositories.{repository_name}.url")
-                self._configured_repositories[
-                    repository_name
-                ] = AuthenticatorRepositoryConfig(repository_name, url)
+                self._configured_repositories[repository_name] = (
+                    AuthenticatorRepositoryConfig(repository_name, url)
+                )
 
         return self._configured_repositories
 

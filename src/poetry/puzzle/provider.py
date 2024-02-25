@@ -1,65 +1,86 @@
 from __future__ import annotations
 
-import functools
+import itertools
 import logging
-import os
 import re
-import tempfile
 import time
-import urllib.parse
 
 from collections import defaultdict
 from contextlib import contextmanager
-from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import ClassVar
 from typing import cast
 
 from cleo.ui.progress_indicator import ProgressIndicator
+from poetry.core.constraints.version import EmptyConstraint
+from poetry.core.constraints.version import Version
+from poetry.core.constraints.version import VersionRange
 from poetry.core.packages.utils.utils import get_python_constraint_from_marker
-from poetry.core.semver.empty_constraint import EmptyConstraint
-from poetry.core.semver.version import Version
 from poetry.core.version.markers import AnyMarker
-from poetry.core.version.markers import MarkerUnion
+from poetry.core.version.markers import union as marker_union
 
-from poetry.inspection.info import PackageInfo
-from poetry.inspection.info import PackageInfoError
 from poetry.mixology.incompatibility import Incompatibility
 from poetry.mixology.incompatibility_cause import DependencyCause
 from poetry.mixology.incompatibility_cause import PythonCause
 from poetry.mixology.term import Term
 from poetry.packages import DependencyPackage
+from poetry.packages.direct_origin import DirectOrigin
 from poetry.packages.package_collection import PackageCollection
 from poetry.puzzle.exceptions import OverrideNeeded
 from poetry.repositories.exceptions import PackageNotFound
-from poetry.utils.helpers import download_file
-from poetry.utils.helpers import safe_extra
-from poetry.vcs.git import Git
+from poetry.utils.helpers import get_file_hash
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterable
     from collections.abc import Iterator
+    from pathlib import Path
 
     from cleo.io.io import IO
+    from packaging.utils import NormalizedName
+    from poetry.core.constraints.version import VersionConstraint
     from poetry.core.packages.dependency import Dependency
     from poetry.core.packages.directory_dependency import DirectoryDependency
     from poetry.core.packages.file_dependency import FileDependency
     from poetry.core.packages.package import Package
-    from poetry.core.packages.specification import PackageSpecification
     from poetry.core.packages.url_dependency import URLDependency
     from poetry.core.packages.vcs_dependency import VCSDependency
-    from poetry.core.semver.version_constraint import VersionConstraint
     from poetry.core.version.markers import BaseMarker
 
-    from poetry.repositories import Pool
+    from poetry.repositories import RepositoryPool
     from poetry.utils.env import Env
 
 
 logger = logging.getLogger(__name__)
 
 
-class Indicator(ProgressIndicator):  # type: ignore[misc]
+class IncompatibleConstraintsError(Exception):
+    """
+    Exception when there are duplicate dependencies with incompatible constraints.
+    """
+
+    def __init__(
+        self, package: Package, *dependencies: Dependency, with_sources: bool = False
+    ) -> None:
+        constraints = []
+        for dep in dependencies:
+            constraint = dep.to_pep_508()
+            if dep.is_direct_origin():
+                # add version info because issue might be a version conflict
+                # with a version constraint
+                constraint += f" ({dep.constraint})"
+            if with_sources and dep.source_name:
+                constraint += f" ; source={dep.source_name}"
+            constraints.append(constraint)
+        super().__init__(
+            f"Incompatible constraints in requirements of {package}:\n"
+            + "\n".join(constraints)
+        )
+
+
+class Indicator(ProgressIndicator):
     CONTEXT: str | None = None
 
     @staticmethod
@@ -85,74 +106,57 @@ class Indicator(ProgressIndicator):  # type: ignore[misc]
         return f"{elapsed:.1f}s"
 
 
-@functools.lru_cache(maxsize=None)
-def _get_package_from_git(
-    url: str,
-    branch: str | None = None,
-    tag: str | None = None,
-    rev: str | None = None,
-    subdirectory: str | None = None,
-    source_root: Path | None = None,
-) -> Package:
-    source = Git.clone(
-        url=url,
-        source_root=source_root,
-        branch=branch,
-        tag=tag,
-        revision=rev,
-        clean=False,
-    )
-    revision = Git.get_revision(source)
-
-    path = Path(source.path)
-    if subdirectory:
-        path = path.joinpath(subdirectory)
-
-    package = Provider.get_package_from_directory(path)
-    package._source_type = "git"
-    package._source_url = url
-    package._source_reference = rev or tag or branch or "HEAD"
-    package._source_resolved_reference = revision
-    package._source_subdirectory = subdirectory
-
-    return package
-
-
 class Provider:
-    UNSAFE_PACKAGES: set[str] = set()
+    UNSAFE_PACKAGES: ClassVar[set[str]] = set()
 
     def __init__(
         self,
         package: Package,
-        pool: Pool,
+        pool: RepositoryPool,
         io: IO,
-        env: Env | None = None,
+        *,
         installed: list[Package] | None = None,
+        locked: list[Package] | None = None,
     ) -> None:
         self._package = package
         self._pool = pool
+        self._direct_origin = DirectOrigin(self._pool.artifact_cache)
         self._io = io
-        self._env = env
+        self._env: Env | None = None
         self._python_constraint = package.python_constraint
         self._is_debugging: bool = self._io.is_debug() or self._io.is_very_verbose()
-        self._in_progress = False
-        self._overrides: dict[DependencyPackage, dict[str, Dependency]] = {}
+        self._overrides: dict[Package, dict[str, Dependency]] = {}
         self._deferred_cache: dict[Dependency, Package] = {}
         self._load_deferred = True
         self._source_root: Path | None = None
         self._installed_packages = installed if installed is not None else []
         self._direct_origin_packages: dict[str, Package] = {}
+        self._locked: dict[NormalizedName, list[DependencyPackage]] = defaultdict(list)
+        self._use_latest: Collection[NormalizedName] = []
+
+        self._explicit_sources: dict[str, str] = {}
+        for package in locked or []:
+            self._locked[package.name].append(
+                DependencyPackage(package.to_dependency(), package)
+            )
+        for dependency_packages in self._locked.values():
+            dependency_packages.sort(
+                key=lambda p: p.package.version,
+                reverse=True,
+            )
 
     @property
-    def pool(self) -> Pool:
+    def pool(self) -> RepositoryPool:
         return self._pool
+
+    @property
+    def use_latest(self) -> Collection[NormalizedName]:
+        return self._use_latest
 
     def is_debugging(self) -> bool:
         return self._is_debugging
 
-    def set_overrides(
-        self, overrides: dict[DependencyPackage, dict[str, Dependency]]
-    ) -> None:
+    def set_overrides(self, overrides: dict[Package, dict[str, Dependency]]) -> None:
         self._overrides = overrides
 
     def load_deferred(self, load_deferred: bool) -> None:
@@ -163,22 +167,32 @@ class Provider:
         original_source_root = self._source_root
         self._source_root = source_root
 
-        yield self
-
-        self._source_root = original_source_root
+        try:
+            yield self
+        finally:
+            self._source_root = original_source_root
 
     @contextmanager
     def use_environment(self, env: Env) -> Iterator[Provider]:
-        original_env = self._env
         original_python_constraint = self._python_constraint
 
         self._env = env
         self._python_constraint = Version.parse(env.marker_env["python_full_version"])
 
-        yield self
+        try:
+            yield self
+        finally:
+            self._env = None
+            self._python_constraint = original_python_constraint
 
-        self._env = original_env
-        self._python_constraint = original_python_constraint
+    @contextmanager
+    def use_latest_for(self, names: Collection[NormalizedName]) -> Iterator[Provider]:
+        self._use_latest = names
+
+        try:
+            yield self
+        finally:
+            self._use_latest = []
 
     @staticmethod
     def validate_package_for_dependency(
@@ -193,11 +207,11 @@ class Provider:
 
     def search_for_installed_packages(
         self,
-        specification: PackageSpecification,
+        dependency: Dependency,
     ) -> list[Package]:
         """
-        Search for installed packages, when available, that provides the given
-        specification.
+        Search for installed packages, when available, that satisfy the given
+        dependency.
 
         This is useful when dealing with packages that are under development, not
         published on package sources and/or only available via system installations.
@@ -207,17 +221,17 @@ class Provider:
 
         logger.debug(
             "Falling back to installed packages to discover metadata for <c2>%s</>",
-            specification.complete_name,
+            dependency.complete_name,
         )
         packages = [
             package
             for package in self._installed_packages
-            if package.provides(specification)
+            if package.satisfies(dependency, ignore_source_type=True)
         ]
         logger.debug(
             "Found <c2>%d</> compatible packages for <c2>%s</>",
             len(packages),
-            specification.complete_name,
+            dependency.complete_name,
         )
         return packages
 
@@ -244,7 +258,7 @@ class Provider:
 
         else:
             raise RuntimeError(
-                f"Unknown direct dependency type {dependency.source_type}"
+                f"{dependency}: unknown direct dependency type {dependency.source_type}"
             )
 
         if dependency.is_vcs():
@@ -279,18 +293,15 @@ class Provider:
         #
         # We rely on the VersionSolver resolving direct-origin dependencies first.
         direct_origin_package = self._direct_origin_packages.get(dependency.name)
-        if direct_origin_package is not None:
-            packages = (
-                [direct_origin_package]
-                if dependency.constraint.allows(direct_origin_package.version)
-                else []
-            )
+        if direct_origin_package and direct_origin_package.satisfies(dependency):
+            packages = [direct_origin_package]
             return PackageCollection(dependency, packages)
 
         packages = self._pool.find_packages(dependency)
 
         packages.sort(
             key=lambda p: (
+                not p.yanked,
                 not p.is_prerelease() and not dependency.allows_prereleases(),
                 p.version,
             ),
@@ -309,7 +320,7 @@ class Provider:
         Basically, we clone the repository in a temporary directory
         and get the information we need by checking out the specified reference.
         """
-        package = self.get_package_from_vcs(
+        package = self._direct_origin.get_package_from_vcs(
             dependency.vcs,
             dependency.source,
             branch=dependency.branch,
@@ -326,30 +337,9 @@ class Provider:
 
         return package
 
-    @staticmethod
-    def get_package_from_vcs(
-        vcs: str,
-        url: str,
-        branch: str | None = None,
-        tag: str | None = None,
-        rev: str | None = None,
-        subdirectory: str | None = None,
-        source_root: Path | None = None,
-    ) -> Package:
-        if vcs != "git":
-            raise ValueError(f"Unsupported VCS dependency {vcs}")
-
-        return _get_package_from_git(
-            url=url,
-            branch=branch,
-            tag=tag,
-            rev=rev,
-            subdirectory=subdirectory,
-            source_root=source_root,
-        )
-
     def _search_for_file(self, dependency: FileDependency) -> Package:
-        package = self.get_package_from_file(dependency.full_path)
+        dependency.validate(raise_error=True)
+        package = self._direct_origin.get_package_from_file(dependency.full_path)
 
         self.validate_package_for_dependency(dependency=dependency, package=package)
 
@@ -357,26 +347,17 @@ class Provider:
             package.root_dir = dependency.base
 
         package.files = [
-            {"file": dependency.path.name, "hash": "sha256:" + dependency.hash()}
+            {
+                "file": dependency.path.name,
+                "hash": "sha256:" + get_file_hash(dependency.full_path),
+            }
         ]
 
         return package
 
-    @classmethod
-    def get_package_from_file(cls, file_path: Path) -> Package:
-        try:
-            package = PackageInfo.from_path(path=file_path).to_package(
-                root_dir=file_path
-            )
-        except PackageInfoError:
-            raise RuntimeError(
-                f"Unable to determine package info from path: {file_path}"
-            )
-
-        return package
-
     def _search_for_directory(self, dependency: DirectoryDependency) -> Package:
-        package = self.get_package_from_directory(dependency.full_path)
+        dependency.validate(raise_error=True)
+        package = self._direct_origin.get_package_from_directory(dependency.full_path)
 
         self.validate_package_for_dependency(dependency=dependency, package=package)
 
@@ -387,12 +368,8 @@ class Provider:
 
         return package
 
-    @classmethod
-    def get_package_from_directory(cls, directory: Path) -> Package:
-        return PackageInfo.from_directory(path=directory).to_package(root_dir=directory)
-
     def _search_for_url(self, dependency: URLDependency) -> Package:
-        package = self.get_package_from_url(dependency.url)
+        package = self._direct_origin.get_package_from_url(dependency.url)
 
         self.validate_package_for_dependency(dependency=dependency, package=package)
 
@@ -406,21 +383,8 @@ class Provider:
 
         return package
 
-    @classmethod
-    def get_package_from_url(cls, url: str) -> Package:
-        file_name = os.path.basename(urllib.parse.urlparse(url).path)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            dest = Path(temp_dir) / file_name
-            download_file(url, str(dest))
-            package = cls.get_package_from_file(dest)
-
-        package._source_type = "url"
-        package._source_url = url
-
-        return package
-
     def _get_dependencies_with_overrides(
-        self, dependencies: list[Dependency], package: DependencyPackage
+        self, dependencies: list[Dependency], package: Package
     ) -> list[Dependency]:
         overrides = self._overrides.get(package, {})
         _dependencies = []
@@ -495,9 +459,7 @@ class Provider:
             and self._python_constraint.allows_any(dep.python_constraint)
             and (not self._env or dep.marker.validate(self._env.marker_env))
         ]
-        dependencies = self._get_dependencies_with_overrides(
-            _dependencies, dependency_package
-        )
+        dependencies = self._get_dependencies_with_overrides(_dependencies, package)
 
         return [
             Incompatibility(
@@ -518,20 +480,17 @@ class Provider:
             package = dependency_package.package
             dependency = dependency_package.dependency
             requires = package.all_requires
-        elif package.source_type not in {
-            "directory",
-            "file",
-            "url",
-            "git",
-        }:
+        elif package.is_direct_origin():
+            requires = package.requires
+        else:
             try:
                 dependency_package = DependencyPackage(
                     dependency,
                     self._pool.package(
-                        package.name,
-                        package.version.text,
+                        package.pretty_name,
+                        package.version,
                         extras=list(dependency.extras),
-                        repository=dependency.source_name,
+                        repository_name=dependency.source_name,
                     ),
                 )
             except PackageNotFound as e:
@@ -546,14 +505,6 @@ class Provider:
             package = dependency_package.package
             dependency = dependency_package.dependency
             requires = package.requires
-        else:
-            requires = package.requires
-
-        if self._load_deferred:
-            # Retrieving constraints for deferred dependencies
-            for r in requires:
-                if r.is_direct_origin():
-                    self.search_for_direct_origin_dependency(r)
 
         optional_dependencies = []
         _dependencies = []
@@ -563,7 +514,6 @@ class Provider:
         # to the current package
         if dependency.extras:
             for extra in dependency.extras:
-                extra = safe_extra(extra)
                 if extra not in package.extras:
                     continue
 
@@ -574,7 +524,15 @@ class Provider:
             )
             package = dependency_package.package
             dependency = dependency_package.dependency
-            _dependencies.append(package.without_features().to_dependency())
+            new_dependency = package.without_features().to_dependency()
+
+            # When adding dependency foo[extra] -> foo, preserve foo's source, if it's
+            # specified. This prevents us from trying to get foo from PyPI
+            # when user explicitly set repo for foo[extra].
+            if not new_dependency.source_name and dependency.source_name:
+                new_dependency.source_name = dependency.source_name
+
+            _dependencies.append(new_dependency)
 
         for dep in requires:
             if not self._python_constraint.allows_any(dep.python_constraint):
@@ -590,18 +548,26 @@ class Provider:
                 (dep.is_optional() and dep.name not in optional_dependencies)
                 or (
                     dep.in_extras
-                    and not set(dep.in_extras).intersection(
-                        {safe_extra(extra) for extra in dependency.extras}
-                    )
+                    and not set(dep.in_extras).intersection(dependency.extras)
                 )
             ):
                 continue
 
             _dependencies.append(dep)
 
-        dependencies = self._get_dependencies_with_overrides(
-            _dependencies, dependency_package
-        )
+        if self._load_deferred:
+            # Retrieving constraints for deferred dependencies
+            for dep in _dependencies:
+                if dep.is_direct_origin():
+                    locked = self.get_locked(dep)
+                    # If lock file contains exactly the same URL and reference
+                    # (commit hash) of dependency as is requested,
+                    # do not analyze it again: nothing could have changed.
+                    if locked is not None and locked.package.is_same_package_as(dep):
+                        continue
+                    self.search_for_direct_origin_dependency(dep)
+
+        dependencies = self._get_dependencies_with_overrides(_dependencies, package)
 
         # Searching for duplicate dependencies
         #
@@ -609,18 +575,18 @@ class Provider:
         # the requirements will be merged.
         #
         # For instance:
-        #   - enum34; python_version=="2.7"
-        #   - enum34; python_version=="3.3"
+        #   • enum34; python_version=="2.7"
+        #   • enum34; python_version=="3.3"
         #
         # will become:
-        #   - enum34; python_version=="2.7" or python_version=="3.3"
+        #   • enum34; python_version=="2.7" or python_version=="3.3"
         #
         # If the duplicate dependencies have different constraints
         # we have to split the dependency graph.
         #
         # An example of this is:
-        #   - pypiwin32 (220); sys_platform == "win32" and python_version >= "3.6"
-        #   - pypiwin32 (219); sys_platform == "win32" and python_version < "3.6"
+        #   • pypiwin32 (220); sys_platform == "win32" and python_version >= "3.6"
+        #   • pypiwin32 (219); sys_platform == "win32" and python_version < "3.6"
         duplicates: dict[str, list[Dependency]] = defaultdict(list)
         for dep in dependencies:
             duplicates[dep.complete_name].append(dep)
@@ -633,56 +599,27 @@ class Provider:
 
             self.debug(f"<debug>Duplicate dependencies for {dep_name}</debug>")
 
-            non_direct_origin_deps: list[Dependency] = []
-            direct_origin_deps: list[Dependency] = []
-            for dep in deps:
-                if dep.is_direct_origin():
-                    direct_origin_deps.append(dep)
-                else:
-                    non_direct_origin_deps.append(dep)
-            deps = (
-                self._merge_dependencies_by_constraint(
-                    self._merge_dependencies_by_marker(non_direct_origin_deps)
-                )
-                + direct_origin_deps
-            )
+            # For dependency resolution, markers of duplicate dependencies must be
+            # mutually exclusive.
+            active_extras = None if package.is_root() else dependency.extras
+            deps = self._resolve_overlapping_markers(package, deps, active_extras)
+
             if len(deps) == 1:
-                self.debug(f"<debug>Merging requirements for {deps[0]!s}</debug>")
+                self.debug(f"<debug>Merging requirements for {dep_name}</debug>")
                 dependencies.append(deps[0])
-                continue
-
-            # We leave dependencies as-is if they have the same
-            # python/platform constraints.
-            # That way the resolver will pickup the conflict
-            # and display a proper error.
-            seen = set()
-            for dep in deps:
-                pep_508_dep = dep.to_pep_508(False)
-                if ";" not in pep_508_dep:
-                    _requirements = ""
-                else:
-                    _requirements = pep_508_dep.split(";")[1].strip()
-
-                if _requirements not in seen:
-                    seen.add(_requirements)
-
-            if len(deps) != len(seen):
-                for dep in deps:
-                    dependencies.append(dep)
-
                 continue
 
             # At this point, we raise an exception that will
             # tell the solver to make new resolutions with specific overrides.
             #
             # For instance, if the foo (1.2.3) package has the following dependencies:
-            #   - bar (>=2.0) ; python_version >= "3.6"
-            #   - bar (<2.0) ; python_version < "3.6"
+            #   • bar (>=2.0) ; python_version >= "3.6"
+            #   • bar (<2.0) ; python_version < "3.6"
             #
             # then the solver will need to make two new resolutions
             # with the following overrides:
-            #   - {<Package foo (1.2.3): {"bar": <Dependency bar (>=2.0)>}
-            #   - {<Package foo (1.2.3): {"bar": <Dependency bar (<2.0)>}
+            #   • {<Package foo (1.2.3): {"bar": <Dependency bar (>=2.0)>}
+            #   • {<Package foo (1.2.3): {"bar": <Dependency bar (<2.0)>}
 
             def fmt_warning(d: Dependency) -> str:
                 dependency_marker = d.marker if not d.marker.is_any() else "*"
@@ -697,56 +634,6 @@ class Provider:
                 f"<warning>Different requirements found for {warnings}.</warning>"
             )
 
-            # We need to check if one of the duplicate dependencies
-            # has no markers. If there is one, we need to change its
-            # environment markers to the inverse of the union of the
-            # other dependencies markers.
-            # For instance, if we have the following dependencies:
-            #   - ipython
-            #   - ipython (1.2.4) ; implementation_name == "pypy"
-            #
-            # the marker for `ipython` will become `implementation_name != "pypy"`.
-            #
-            # Further, we have to merge the constraints of the requirements
-            # without markers into the constraints of the requirements with markers.
-            # for instance, if we have the following dependencies:
-            #   - foo (>= 1.2)
-            #   - foo (!= 1.2.1) ; python == 3.10
-            #
-            # the constraint for the second entry will become (!= 1.2.1, >= 1.2)
-            any_markers_dependencies = [d for d in deps if d.marker.is_any()]
-            other_markers_dependencies = [d for d in deps if not d.marker.is_any()]
-
-            marker = other_markers_dependencies[0].marker
-            for other_dep in other_markers_dependencies[1:]:
-                marker = marker.union(other_dep.marker)
-            inverted_marker = marker.invert()
-
-            if any_markers_dependencies:
-                for dep_any in any_markers_dependencies:
-                    dep_any.marker = inverted_marker
-                    for dep_other in other_markers_dependencies:
-                        dep_other.constraint = dep_other.constraint.intersect(
-                            dep_any.constraint
-                        )
-            elif not inverted_marker.is_empty() and self._python_constraint.allows_any(
-                get_python_constraint_from_marker(inverted_marker)
-            ):
-                # if there is no any marker dependency
-                # and the inverted marker is not empty,
-                # a dependency with the inverted union of all markers is required
-                # in order to not miss other dependencies later, for instance:
-                #   - foo (1.0) ; python == 3.7
-                #   - foo (2.0) ; python == 3.8
-                #   - bar (2.0) ; python == 3.8
-                #   - bar (3.0) ; python == 3.9
-                #
-                # the last dependency would be missed without this,
-                # because the intersection with both foo dependencies is empty
-                inverted_marker_dep = deps[0].with_constraint(EmptyConstraint())
-                inverted_marker_dep.marker = inverted_marker
-                deps.append(inverted_marker_dep)
-
             overrides = []
             overrides_marker_intersection: BaseMarker = AnyMarker()
             for dep_overrides in self._overrides.values():
@@ -757,11 +644,9 @@ class Provider:
             for dep in deps:
                 if not overrides_marker_intersection.intersect(dep.marker).is_empty():
                     current_overrides = self._overrides.copy()
-                    package_overrides = current_overrides.get(
-                        dependency_package, {}
-                    ).copy()
+                    package_overrides = current_overrides.get(package, {}).copy()
                     package_overrides.update({dep.name: dep})
-                    current_overrides.update({dependency_package: package_overrides})
+                    current_overrides.update({package: package_overrides})
                     overrides.append(current_overrides)
 
             if overrides:
@@ -771,18 +656,18 @@ class Provider:
         clean_dependencies = []
         for dep in dependencies:
             if not dependency.transitive_marker.without_extras().is_any():
-                marker_intersection = (
+                transitive_marker_intersection = (
                     dependency.transitive_marker.without_extras().intersect(
                         dep.marker.without_extras()
                     )
                 )
-                if marker_intersection.is_empty():
+                if transitive_marker_intersection.is_empty():
                     # The dependency is not needed, since the markers specified
                     # for the current package selection are not compatible with
                     # the markers for the current dependency, so we skip it
                     continue
 
-                dep.transitive_marker = marker_intersection
+                dep.transitive_marker = transitive_marker_intersection
 
             if not dependency.python_constraint.is_any():
                 python_constraint_intersection = dep.python_constraint.intersect(
@@ -791,7 +676,6 @@ class Provider:
                 if python_constraint_intersection.is_empty():
                     # This dependency is not needed under current python constraint.
                     continue
-                dep.transitive_python_versions = str(python_constraint_intersection)
 
             clean_dependencies.append(dep)
 
@@ -801,7 +685,30 @@ class Provider:
         for dep in clean_dependencies:
             package.add_dependency(dep)
 
+        if self._locked and package.is_root():
+            # At this point all duplicates have been eliminated via overrides
+            # so that explicit sources are unambiguous.
+            # Clear _explicit_sources because it might be filled
+            # from a previous override.
+            self._explicit_sources.clear()
+            for dep in clean_dependencies:
+                if dep.source_name:
+                    self._explicit_sources[dep.name] = dep.source_name
+
         return dependency_package
+
+    def get_locked(self, dependency: Dependency) -> DependencyPackage | None:
+        if dependency.name in self._use_latest:
+            return None
+
+        locked = self._locked.get(dependency.name, [])
+        for dependency_package in locked:
+            package = dependency_package.package
+            if package.satisfies(dependency):
+                if explicit_source := self._explicit_sources.get(dependency.name):
+                    dependency.source_name = explicit_source
+                return DependencyPackage(dependency, package)
+        return None
 
     def debug(self, message: str, depth: int = 0) -> None:
         if not (self._io.is_very_verbose() or self._io.is_debug()):
@@ -889,71 +796,160 @@ class Provider:
 
             self._io.write(debug_info)
 
-    @contextmanager
-    def progress(self) -> Iterator[None]:
-        if not self._io.output.is_decorated() or self.is_debugging():
-            self._io.write_line("Resolving dependencies...")
-            yield
-        else:
-            indicator = Indicator(
-                self._io, "{message}{context}<debug>({elapsed:2s})</debug>"
-            )
-
-            with indicator.auto(
-                "<info>Resolving dependencies...</info>",
-                "<info>Resolving dependencies...</info>",
-            ):
-                yield
-
-        self._in_progress = False
+    def _group_by_source(
+        self, dependencies: Iterable[Dependency]
+    ) -> list[list[Dependency]]:
+        """
+        Takes a list of dependencies and returns a list of groups of dependencies,
+        each group containing all dependencies from the same source.
+        """
+        groups: list[list[Dependency]] = []
+        for dep in dependencies:
+            for group in groups:
+                if (
+                    dep.is_same_source_as(group[0])
+                    and dep.source_name == group[0].source_name
+                ):
+                    group.append(dep)
+                    break
+            else:
+                groups.append([dep])
+        return groups
 
     def _merge_dependencies_by_constraint(
         self, dependencies: Iterable[Dependency]
     ) -> list[Dependency]:
-        by_constraint: dict[VersionConstraint, list[Dependency]] = defaultdict(list)
-        for dep in dependencies:
-            by_constraint[dep.constraint].append(dep)
-        for constraint, _deps in by_constraint.items():
-            new_markers = []
-            for dep in _deps:
-                marker = dep.marker.without_extras()
-                if marker.is_any():
-                    # No marker or only extras
-                    continue
+        """
+        Merge dependencies with the same constraint
+        by building a union of their markers.
 
-                new_markers.append(marker)
+        For instance, if we have:
+           - foo (>=2.0) ; python_version >= "3.6" and python_version < "3.7"
+           - foo (>=2.0) ; python_version >= "3.7"
+        we can avoid two overrides by merging them to:
+           - foo (>=2.0) ; python_version >= "3.6"
+        """
+        dep_groups = self._group_by_source(dependencies)
+        merged_dependencies = []
+        for group in dep_groups:
+            by_constraint: dict[VersionConstraint, list[Dependency]] = defaultdict(list)
+            for dep in group:
+                by_constraint[dep.constraint].append(dep)
+            for deps in by_constraint.values():
+                dep = deps[0]
+                if len(deps) > 1:
+                    new_markers = (dep.marker for dep in deps)
+                    dep.marker = marker_union(*new_markers)
+                merged_dependencies.append(dep)
 
-            if not new_markers:
+        return merged_dependencies
+
+    def _is_relevant_marker(
+        self, marker: BaseMarker, active_extras: Collection[NormalizedName] | None
+    ) -> bool:
+        """
+        A marker is relevant if
+        - it is not empty
+        - allowed by the project's python constraint
+        - allowed by active extras of the dependency (not relevant for root package)
+        - allowed by the environment (only during installation)
+        """
+        return (
+            not marker.is_empty()
+            and self._python_constraint.allows_any(
+                get_python_constraint_from_marker(marker)
+            )
+            and (active_extras is None or marker.validate({"extra": active_extras}))
+            and (not self._env or marker.validate(self._env.marker_env))
+        )
+
+    def _resolve_overlapping_markers(
+        self,
+        package: Package,
+        dependencies: list[Dependency],
+        active_extras: Collection[NormalizedName] | None,
+    ) -> list[Dependency]:
+        """
+        Convert duplicate dependencies with potentially overlapping markers
+        into duplicate dependencies with mutually exclusive markers.
+
+        Therefore, the intersections of all combinations of markers and inverted markers
+        have to be calculated. If such an intersection is relevant (not empty, etc.),
+        the intersection of all constraints, whose markers were not inverted is built
+        and a new dependency with the calculated version constraint and marker is added.
+        (The marker of such a dependency does not overlap with the marker
+        of any other new dependency.)
+        """
+        # In order to reduce the number of intersections,
+        # we merge duplicate dependencies by constraint.
+        dependencies = self._merge_dependencies_by_constraint(dependencies)
+
+        new_dependencies = []
+        for uses in itertools.product([True, False], repeat=len(dependencies)):
+            # intersection of markers
+            # For performance optimization, we don't just intersect all markers at once,
+            # but intersect them one after the other to get empty markers early.
+            # Further, we intersect the inverted markers at last because
+            # they are more likely to overlap than the non-inverted ones.
+            markers = (
+                dep.marker if use else dep.marker.invert()
+                for use, dep in sorted(
+                    zip(uses, dependencies), key=lambda ud: ud[0], reverse=True
+                )
+            )
+            used_marker_intersection: BaseMarker = AnyMarker()
+            for m in markers:
+                used_marker_intersection = used_marker_intersection.intersect(m)
+            if not self._is_relevant_marker(used_marker_intersection, active_extras):
                 continue
 
-            dep = _deps[0]
-            dep.marker = dep.marker.union(MarkerUnion(*new_markers))
-            by_constraint[constraint] = [dep]
+            # intersection of constraints
+            constraint: VersionConstraint = VersionRange()
+            specific_source_dependency = None
+            used_dependencies = list(itertools.compress(dependencies, uses))
+            for dep in used_dependencies:
+                if dep.is_direct_origin() or dep.source_name:
+                    # if direct origin or specific source:
+                    # conflict if specific source already set and not the same
+                    if specific_source_dependency and (
+                        not dep.is_same_source_as(specific_source_dependency)
+                        or dep.source_name != specific_source_dependency.source_name
+                    ):
+                        raise IncompatibleConstraintsError(
+                            package, dep, specific_source_dependency, with_sources=True
+                        )
+                    specific_source_dependency = dep
+                constraint = constraint.intersect(dep.constraint)
+            if constraint.is_empty():
+                # conflict in overlapping area
+                raise IncompatibleConstraintsError(package, *used_dependencies)
 
-        return [value[0] for value in by_constraint.values()]
+            if not any(uses):
+                # This is an edge case where the dependency is not required
+                # for the resulting marker. However, we have to consider it anyway
+                #  in order to not miss other dependencies later, for instance:
+                #   • foo (1.0) ; python == 3.7
+                #   • foo (2.0) ; python == 3.8
+                #   • bar (2.0) ; python == 3.8
+                #   • bar (3.0) ; python == 3.9
+                # the last dependency would be missed without this,
+                # because the intersection with both foo dependencies is empty.
 
-    def _merge_dependencies_by_marker(
-        self, dependencies: Iterable[Dependency]
-    ) -> list[Dependency]:
-        by_marker: dict[BaseMarker, list[Dependency]] = defaultdict(list)
-        for dep in dependencies:
-            by_marker[dep.marker].append(dep)
-        deps = []
-        for _deps in by_marker.values():
-            if len(_deps) == 1:
-                deps.extend(_deps)
-            else:
-                new_constraint = _deps[0].constraint
-                for dep in _deps[1:]:
-                    new_constraint = new_constraint.intersect(dep.constraint)
-                if new_constraint.is_empty():
-                    # leave dependencies as-is so the resolver will pickup
-                    # the conflict and display a proper error.
-                    deps.extend(_deps)
-                else:
-                    self.debug(
-                        f"<debug>Merging constraints for {_deps[0].name} for"
-                        f" marker {_deps[0].marker}</debug>"
-                    )
-                    deps.append(_deps[0].with_constraint(new_constraint))
-        return deps
+                # Set constraint to empty to mark dependency as "not required".
+                constraint = EmptyConstraint()
+                used_dependencies = dependencies
+
+            # build new dependency with intersected constraint and marker
+            # (and correct source)
+            new_dep = (
+                specific_source_dependency
+                if specific_source_dependency
+                else used_dependencies[0]
+            ).with_constraint(constraint)
+            new_dep.marker = used_marker_intersection
+            new_dependencies.append(new_dep)
+
+        # In order to reduce the number of overrides we merge duplicate
+        # dependencies by constraint again. After overlapping markers were
+        # resolved, there might be new dependencies with the same constraint.
+        return self._merge_dependencies_by_constraint(new_dependencies)

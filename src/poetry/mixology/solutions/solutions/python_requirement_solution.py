@@ -10,9 +10,9 @@ if TYPE_CHECKING:
     from poetry.puzzle.exceptions import SolverProblemError
 
 
-class PythonRequirementSolution(Solution):  # type: ignore[misc]
+class PythonRequirementSolution(Solution):
     def __init__(self, exception: SolverProblemError) -> None:
-        from poetry.core.semver.helpers import parse_constraint
+        from poetry.core.constraints.version import parse_constraint
 
         from poetry.mixology.incompatibility_cause import PythonCause
 
@@ -58,6 +58,6 @@ class PythonRequirementSolution(Solution):  # type: ignore[misc]
     @property
     def documentation_links(self) -> list[str]:
         return [
-            "https://python-poetry.org/docs/dependency-specification/#python-restricted-dependencies",  # noqa: E501
-            "https://python-poetry.org/docs/dependency-specification/#using-environment-markers",  # noqa: E501
+            "https://python-poetry.org/docs/dependency-specification/#python-restricted-dependencies",
+            "https://python-poetry.org/docs/dependency-specification/#using-environment-markers",
         ]

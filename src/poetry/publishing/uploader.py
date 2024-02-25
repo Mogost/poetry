@@ -10,16 +10,12 @@ from typing import Any
 import requests
 
 from poetry.core.masonry.metadata import Metadata
-from poetry.core.masonry.utils.helpers import escape_name
-from poetry.core.masonry.utils.helpers import escape_version
-from poetry.core.utils.helpers import normalize_version
-from requests import adapters
+from poetry.core.masonry.utils.helpers import distribution_name
 from requests.exceptions import ConnectionError
 from requests.exceptions import HTTPError
 from requests_toolbelt import user_agent
 from requests_toolbelt.multipart import MultipartEncoder
 from requests_toolbelt.multipart import MultipartEncoderMonitor
-from urllib3 import util
 
 from poetry.__version__ import __version__
 from poetry.utils.constants import REQUESTS_TIMEOUT
@@ -31,31 +27,33 @@ if TYPE_CHECKING:
 
     from poetry.poetry import Poetry
 
-_has_blake2 = hasattr(hashlib, "blake2b")
-
 
 class UploadError(Exception):
     def __init__(self, error: ConnectionError | HTTPError | str) -> None:
         if isinstance(error, HTTPError):
-            message = (
-                f"HTTP Error {error.response.status_code}: {error.response.reason} |"
-                f" {error.response.content!r}"
-            )
+            if error.response is None:
+                message = "HTTP Error connecting to the repository"
+            else:
+                message = (
+                    f"HTTP Error {error.response.status_code}: "
+                    f"{error.response.reason} | {error.response.content!r}"
+                )
         elif isinstance(error, ConnectionError):
             message = (
                 "Connection Error: We were unable to connect to the repository, "
                 "ensure the url is correct and can be reached."
             )
         else:
-            message = str(error)
+            message = error
         super().__init__(message)
 
 
 class Uploader:
-    def __init__(self, poetry: Poetry, io: IO) -> None:
+    def __init__(self, poetry: Poetry, io: IO, dist_dir: Path | None = None) -> None:
         self._poetry = poetry
         self._package = poetry.package
         self._io = io
+        self._dist_dir = dist_dir or self.default_dist_dir
         self._username: str | None = None
         self._password: str | None = None
 
@@ -65,28 +63,24 @@ class Uploader:
         return agent
 
     @property
-    def adapter(self) -> adapters.HTTPAdapter:
-        retry = util.Retry(
-            connect=5,
-            total=10,
-            allowed_methods=["GET"],
-            status_forcelist=[500, 501, 502, 503],
-        )
+    def default_dist_dir(self) -> Path:
+        return self._poetry.file.path.parent / "dist"
 
-        return adapters.HTTPAdapter(max_retries=retry)
+    @property
+    def dist_dir(self) -> Path:
+        if not self._dist_dir.is_absolute():
+            return self._poetry.file.path.parent / self._dist_dir
+
+        return self._dist_dir
 
     @property
     def files(self) -> list[Path]:
-        dist = self._poetry.file.parent / "dist"
-        version = normalize_version(self._package.version.text)
+        dist = self.dist_dir
+        version = self._package.version.to_string()
+        escaped_name = distribution_name(self._package.name)
 
-        wheels = list(
-            dist.glob(
-                f"{escape_name(self._package.pretty_name)}-{escape_version(version)}"
-                "-*.whl"
-            )
-        )
-        tars = list(dist.glob(f"{self._package.pretty_name}-{version}.tar.gz"))
+        wheels = list(dist.glob(f"{escaped_name}-{version}-*.whl"))
+        tars = list(dist.glob(f"{escaped_name}-{version}.tar.gz"))
 
         return sorted(wheels + tars)
 
@@ -95,15 +89,12 @@ class Uploader:
         self._password = password
 
     def make_session(self) -> requests.Session:
-        session = requests.session()
+        session = requests.Session()
         auth = self.get_auth()
         if auth is not None:
             session.auth = auth
 
         session.headers["User-Agent"] = self.user_agent
-        for scheme in ("http://", "https://"):
-            session.mount(scheme, self.adapter)
-
         return session
 
     def get_auth(self) -> tuple[str, str] | None:
@@ -127,18 +118,15 @@ class Uploader:
         if client_cert:
             session.cert = str(client_cert)
 
-        try:
+        with session:
             self._upload(session, url, dry_run, skip_existing)
-        finally:
-            session.close()
 
     def post_data(self, file: Path) -> dict[str, Any]:
         meta = Metadata.from_package(self._package)
 
         file_type = self._get_type(file)
 
-        if _has_blake2:
-            blake2_256_hash = hashlib.blake2b(digest_size=256 // 8)
+        blake2_256_hash = hashlib.blake2b(digest_size=256 // 8)
 
         md5_hash = hashlib.md5()
         sha256_hash = hashlib.sha256()
@@ -146,15 +134,11 @@ class Uploader:
             for content in iter(lambda: fp.read(io.DEFAULT_BUFFER_SIZE), b""):
                 md5_hash.update(content)
                 sha256_hash.update(content)
-
-                if _has_blake2:
-                    blake2_256_hash.update(content)
+                blake2_256_hash.update(content)
 
         md5_digest = md5_hash.hexdigest()
         sha2_digest = sha256_hash.hexdigest()
-        blake2_256_digest: str | None = None
-        if _has_blake2:
-            blake2_256_digest = blake2_256_hash.hexdigest()
+        blake2_256_digest = blake2_256_hash.hexdigest()
 
         py_version: str | None = None
         if file_type == "bdist_wheel":
@@ -217,8 +201,6 @@ class Uploader:
         skip_existing: bool = False,
     ) -> None:
         for file in self.files:
-            # TODO: Check existence
-
             self._upload_file(session, url, file, dry_run, skip_existing)
 
     def _upload_file(
@@ -230,6 +212,9 @@ class Uploader:
         skip_existing: bool = False,
     ) -> None:
         from cleo.ui.progress_bar import ProgressBar
+
+        if not file.is_file():
+            raise UploadError(f"Archive ({file}) does not exist")
 
         data = self.post_data(file)
         data.update(
@@ -271,7 +256,7 @@ class Uploader:
                         f" - Uploading <c1>{file.name}</c1> <fg=green>%percent%%</>"
                     )
                     bar.finish()
-                elif resp.status_code == 301:
+                elif 300 <= resp.status_code < 400:
                     if self._io.output.is_decorated():
                         self._io.overwrite(
                             f" - Uploading <c1>{file.name}</c1> <error>FAILED</>"
@@ -304,11 +289,9 @@ class Uploader:
         """
         Register a package to a repository.
         """
-        dist = self._poetry.file.parent / "dist"
-        file = (
-            dist
-            / f"{self._package.name}-{normalize_version(self._package.version.text)}.tar.gz"  # noqa: E501
-        )
+        dist = self.dist_dir
+        escaped_name = distribution_name(self._package.name)
+        file = dist / f"{escaped_name}-{self._package.version.to_string()}.tar.gz"
 
         if not file.exists():
             raise RuntimeError(f'"{file.name}" does not exist.')
@@ -351,7 +334,7 @@ class Uploader:
         raise ValueError("Unknown distribution format " + "".join(exts))
 
     def _is_file_exists_error(self, response: requests.Response) -> bool:
-        # based on https://github.com/pypa/twine/blob/a6dd69c79f7b5abfb79022092a5d3776a499e31b/twine/commands/upload.py#L32  # noqa: E501
+        # based on https://github.com/pypa/twine/blob/a6dd69c79f7b5abfb79022092a5d3776a499e31b/twine/commands/upload.py#L32
         status = response.status_code
         reason = response.reason.lower()
         text = response.text.lower()

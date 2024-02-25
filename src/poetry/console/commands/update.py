@@ -24,6 +24,12 @@ class UpdateCommand(InstallerCommand):
             " (<warning>Deprecated</warning>)",
         ),
         option(
+            "sync",
+            None,
+            "Synchronize the environment with the locked packages and the specified"
+            " groups.",
+        ),
+        option(
             "dry-run",
             None,
             "Output the operations but do not execute anything "
@@ -36,19 +42,15 @@ class UpdateCommand(InstallerCommand):
 
     def handle(self) -> int:
         packages = self.argument("packages")
-
-        self._installer.use_executor(
-            self.poetry.config.get("experimental.new-installer", False)
-        )
-
         if packages:
-            self._installer.whitelist({name: "*" for name in packages})
+            self.installer.whitelist({name: "*" for name in packages})
 
-        self._installer.only_groups(self.activated_groups)
-        self._installer.dry_run(self.option("dry-run"))
-        self._installer.execute_operations(not self.option("lock"))
+        self.installer.only_groups(self.activated_groups)
+        self.installer.dry_run(self.option("dry-run"))
+        self.installer.requires_synchronization(self.option("sync"))
+        self.installer.execute_operations(not self.option("lock"))
 
         # Force update
-        self._installer.update(True)
+        self.installer.update(True)
 
-        return self._installer.run()
+        return self.installer.run()

@@ -5,12 +5,12 @@ import functools
 import glob
 import logging
 import os
-import tarfile
-import zipfile
 
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Mapping
+from typing import Sequence
 
 import pkginfo
 
@@ -21,17 +21,19 @@ from poetry.core.pyproject.toml import PyProjectTOML
 from poetry.core.utils.helpers import parse_requires
 from poetry.core.utils.helpers import temporary_directory
 from poetry.core.version.markers import InvalidMarker
+from poetry.core.version.requirements import InvalidRequirement
 
 from poetry.utils.env import EnvCommandError
 from poetry.utils.env import ephemeral_environment
+from poetry.utils.helpers import extractall
 from poetry.utils.setup_reader import SetupReader
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from collections.abc import Iterator
-    from contextlib import AbstractContextManager
 
+    from packaging.metadata import RawMetadata
+    from packaging.utils import NormalizedName
     from poetry.core.packages.project_package import ProjectPackage
 
 
@@ -40,51 +42,49 @@ logger = logging.getLogger(__name__)
 PEP517_META_BUILD = """\
 import build
 import build.env
-import pep517
+import pyproject_hooks
 
 source = '{source}'
 dest = '{dest}'
 
-with build.env.IsolatedEnvBuilder() as env:
-    builder = build.ProjectBuilder(
-        srcdir=source,
-        scripts_dir=env.scripts_dir,
-        python_executable=env.executable,
-        runner=pep517.quiet_subprocess_runner,
+with build.env.DefaultIsolatedEnv() as env:
+    builder = build.ProjectBuilder.from_isolated_env(
+        env, source, runner=pyproject_hooks.quiet_subprocess_runner
     )
     env.install(builder.build_system_requires)
     env.install(builder.get_requires_for_build('wheel'))
     builder.metadata_path(dest)
 """
 
-PEP517_META_BUILD_DEPS = ["build===0.7.0", "pep517==0.12.0"]
+PEP517_META_BUILD_DEPS = ["build==1.0.3", "pyproject_hooks==1.0.0"]
 
 
 class PackageInfoError(ValueError):
-    def __init__(self, path: Path | str, *reasons: BaseException | str) -> None:
-        reasons = (f"Unable to determine package info for path: {path!s}",) + reasons
+    def __init__(self, path: Path, *reasons: BaseException | str) -> None:
+        reasons = (f"Unable to determine package info for path: {path!s}", *reasons)
         super().__init__("\n\n".join(str(msg).strip() for msg in reasons if msg))
 
 
 class PackageInfo:
     def __init__(
         self,
+        *,
         name: str | None = None,
         version: str | None = None,
         summary: str | None = None,
-        platform: str | None = None,
         requires_dist: list[str] | None = None,
         requires_python: str | None = None,
-        files: list[dict[str, str]] | None = None,
+        files: Sequence[Mapping[str, str]] | None = None,
+        yanked: str | bool = False,
         cache_version: str | None = None,
     ) -> None:
         self.name = name
         self.version = version
         self.summary = summary
-        self.platform = platform
         self.requires_dist = requires_dist
         self.requires_python = requires_python
         self.files = files or []
+        self.yanked = yanked
         self._cache_version = cache_version
         self._source_type: str | None = None
         self._source_url: str | None = None
@@ -98,7 +98,6 @@ class PackageInfo:
         self.name = other.name or self.name
         self.version = other.version or self.version
         self.summary = other.summary or self.summary
-        self.platform = other.platform or self.platform
         self.requires_dist = other.requires_dist or self.requires_dist
         self.requires_python = other.requires_python or self.requires_python
         self.files = other.files or self.files
@@ -113,10 +112,10 @@ class PackageInfo:
             "name": self.name,
             "version": self.version,
             "summary": self.summary,
-            "platform": self.platform,
             "requires_dist": self.requires_dist,
             "requires_python": self.requires_python,
             "files": self.files,
+            "yanked": self.yanked,
             "_cache_version": self._cache_version,
         }
 
@@ -163,6 +162,7 @@ class PackageInfo:
             source_type=self._source_type,
             source_url=self._source_url,
             source_reference=self._source_reference,
+            yanked=self.yanked,
         )
         if self.summary is not None:
             package.description = self.summary
@@ -190,37 +190,48 @@ class PackageInfo:
 
         seen_requirements = set()
 
+        package_extras: dict[NormalizedName, list[Dependency]] = {}
         for req in self.requires_dist or []:
             try:
                 # Attempt to parse the PEP-508 requirement string
                 dependency = Dependency.create_from_pep_508(req, relative_to=root_dir)
             except InvalidMarker:
                 # Invalid marker, We strip the markers hoping for the best
+                logger.warning(
+                    "Stripping invalid marker (%s) found in %s-%s dependencies",
+                    req,
+                    package.name,
+                    package.version,
+                )
                 req = req.split(";")[0]
                 dependency = Dependency.create_from_pep_508(req, relative_to=root_dir)
-            except ValueError:
-                # Likely unable to parse constraint so we skip it
-                logger.debug(
-                    f"Invalid constraint ({req}) found in"
-                    f" {package.name}-{package.version} dependencies, skipping",
+            except InvalidRequirement:
+                # Unable to parse requirement so we skip it
+                logger.warning(
+                    "Invalid requirement (%s) found in %s-%s dependencies, skipping",
+                    req,
+                    package.name,
+                    package.version,
                 )
                 continue
 
             if dependency.in_extras:
                 # this dependency is required by an extra package
                 for extra in dependency.in_extras:
-                    if extra not in package.extras:
+                    if extra not in package_extras:
                         # this is the first time we encounter this extra for this
                         # package
-                        package.extras[extra] = []
+                        package_extras[extra] = []
 
-                    package.extras[extra].append(dependency)
+                    package_extras[extra].append(dependency)
 
             req = dependency.to_pep_508(with_extras=True)
 
             if req not in seen_requirements:
                 package.add_dependency(dependency)
                 seen_requirements.add(req)
+
+        package.extras = package_extras
 
         return package
 
@@ -241,14 +252,13 @@ class PackageInfo:
         else:
             requires = Path(dist.filename) / "requires.txt"
             if requires.exists():
-                with requires.open(encoding="utf-8") as f:
-                    requirements = parse_requires(f.read())
+                text = requires.read_text(encoding="utf-8")
+                requirements = parse_requires(text)
 
         info = cls(
             name=dist.name,
             version=dist.version,
             summary=dist.summary,
-            platform=dist.supported_platforms,
             requires_dist=requirements,
             requires_python=dist.requires_python,
         )
@@ -269,40 +279,29 @@ class PackageInfo:
         """
         info = None
 
-        try:
-            info = cls._from_distribution(pkginfo.SDist(str(path)))
-        except ValueError:
-            # Unable to determine dependencies
-            # We pass and go deeper
-            pass
-        else:
-            if info.requires_dist is not None:
-                # we successfully retrieved dependencies from sdist metadata
-                return info
+        with contextlib.suppress(ValueError):
+            sdist = pkginfo.SDist(str(path))
+            info = cls._from_distribution(sdist)
+
+        if info is not None and info.requires_dist is not None:
+            # we successfully retrieved dependencies from sdist metadata
+            return info
 
         # Still not dependencies found
         # So, we unpack and introspect
         suffix = path.suffix
+        zip = suffix == ".zip"
 
-        context: Callable[
-            [str], AbstractContextManager[zipfile.ZipFile | tarfile.TarFile]
-        ]
-        if suffix == ".zip":
-            context = zipfile.ZipFile
-        else:
-            if suffix == ".bz2":
-                suffixes = path.suffixes
-                if len(suffixes) > 1 and suffixes[-2] == ".tar":
-                    suffix = ".tar.bz2"
-            else:
-                suffix = ".tar.gz"
-
-            context = tarfile.open
+        if suffix == ".bz2":
+            suffixes = path.suffixes
+            if len(suffixes) > 1 and suffixes[-2] == ".tar":
+                suffix = ".tar.bz2"
+        elif not zip:
+            suffix = ".tar.gz"
 
         with temporary_directory() as tmp_str:
             tmp = Path(tmp_str)
-            with context(path.as_posix()) as archive:
-                archive.extractall(tmp.as_posix())
+            extractall(source=path, dest=tmp, zip=zip)
 
             # a little bit of guess work to determine the directory we care about
             elements = list(tmp.glob("*"))
@@ -316,6 +315,8 @@ class PackageInfo:
 
             # now this is an unpacked directory we know how to deal with
             new_info = cls.from_directory(path=sdist_dir)
+            new_info._source_type = "file"
+            new_info._source_url = path.resolve().as_posix()
 
         if not info:
             return new_info
@@ -398,7 +399,22 @@ class PackageInfo:
             yield Path(d)
 
     @classmethod
-    def from_metadata(cls, path: Path) -> PackageInfo | None:
+    def from_metadata(cls, metadata: RawMetadata) -> PackageInfo:
+        """
+        Create package information from core metadata.
+
+        :param metadata: raw metadata
+        """
+        return cls(
+            name=metadata.get("name"),
+            version=metadata.get("version"),
+            summary=metadata.get("summary"),
+            requires_dist=metadata.get("requires_dist"),
+            requires_python=metadata.get("requires_python"),
+        )
+
+    @classmethod
+    def from_metadata_directory(cls, path: Path) -> PackageInfo | None:
         """
         Helper method to parse package information from an unpacked metadata directory.
 
@@ -409,6 +425,7 @@ class PackageInfo:
         else:
             directories = list(cls._find_dist_info(path=path))
 
+        dist: pkginfo.BDist | pkginfo.SDist | pkginfo.Wheel
         for directory in directories:
             try:
                 if directory.suffix == ".egg-info":
@@ -446,10 +463,10 @@ class PackageInfo:
             name=package.name,
             version=str(package.version),
             summary=package.description,
-            platform=package.platform,
             requires_dist=list(requires),
             requires_python=package.python_versions,
             files=package.files,
+            yanked=package.yanked_reason if package.yanked else False,
         )
 
     @staticmethod
@@ -457,7 +474,9 @@ class PackageInfo:
         # Note: we ignore any setup.py file at this step
         # TODO: add support for handling non-poetry PEP-517 builds
         if PyProjectTOML(path.joinpath("pyproject.toml")).is_poetry_project():
-            return Factory().create_poetry(path).package
+            with contextlib.suppress(RuntimeError):
+                return Factory().create_poetry(path).package
+
         return None
 
     @classmethod
@@ -477,7 +496,7 @@ class PackageInfo:
         if project_package:
             info = cls.from_package(project_package)
         else:
-            info = cls.from_metadata(path)
+            info = cls.from_metadata_directory(path)
 
             if not info or info.requires_dist is None:
                 try:
@@ -518,7 +537,8 @@ class PackageInfo:
         :param path: Path to wheel.
         """
         try:
-            return cls._from_distribution(pkginfo.Wheel(str(path)))
+            wheel = pkginfo.Wheel(str(path))
+            return cls._from_distribution(wheel)
         except ValueError:
             return PackageInfo()
 
@@ -529,14 +549,12 @@ class PackageInfo:
 
         :param path: Path to bdist.
         """
-        if isinstance(path, (pkginfo.BDist, pkginfo.Wheel)):
-            cls._from_distribution(dist=path)
-
         if path.suffix == ".whl":
             return cls.from_wheel(path=path)
 
         try:
-            return cls._from_distribution(pkginfo.BDist(str(path)))
+            bdist = pkginfo.BDist(str(path))
+            return cls._from_distribution(bdist)
         except ValueError as e:
             raise PackageInfoError(path, e)
 
@@ -568,7 +586,7 @@ def get_pep517_metadata(path: Path) -> PackageInfo:
             return info
 
     with ephemeral_environment(
-        flags={"no-pip": False, "no-setuptools": False, "no-wheel": False}
+        flags={"no-pip": False, "setuptools": "bundle", "wheel": "bundle"}
     ) as venv:
         # TODO: cache PEP 517 build environment corresponding to each project venv
         dest_dir = venv.path.parent / "dist"
@@ -583,14 +601,11 @@ def get_pep517_metadata(path: Path) -> PackageInfo:
                 "install",
                 "--disable-pip-version-check",
                 "--ignore-installed",
+                "--no-input",
                 *PEP517_META_BUILD_DEPS,
             )
-            venv.run(
-                "python",
-                "-",
-                input_=pep517_meta_build_script,
-            )
-            info = PackageInfo.from_metadata(dest_dir)
+            venv.run_python_script(pep517_meta_build_script)
+            info = PackageInfo.from_metadata_directory(dest_dir)
         except EnvCommandError as e:
             # something went wrong while attempting pep517 metadata build
             # fallback to egg_info if setup.py available
@@ -604,16 +619,16 @@ def get_pep517_metadata(path: Path) -> PackageInfo:
                 )
 
             cwd = Path.cwd()
-            os.chdir(path.as_posix())
+            os.chdir(path)
             try:
                 venv.run("python", "setup.py", "egg_info")
-                info = PackageInfo.from_metadata(path)
+                info = PackageInfo.from_metadata_directory(path)
             except EnvCommandError as fbe:
                 raise PackageInfoError(
-                    path, "Fallback egg_info generation failed.", fbe
+                    path, e, "Fallback egg_info generation failed.", fbe
                 )
             finally:
-                os.chdir(cwd.as_posix())
+                os.chdir(cwd)
 
     if info:
         logger.debug("Falling back to parsed setup.py file for %s", path)

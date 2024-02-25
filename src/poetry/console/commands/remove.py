@@ -18,13 +18,20 @@ class RemoveCommand(InstallerCommand):
     arguments = [argument("packages", "The packages to remove.", multiple=True)]
     options = [
         option("group", "G", "The group to remove the dependency from.", flag=False),
-        option("dev", "D", "Remove a package from the development dependencies."),
+        option(
+            "dev",
+            "D",
+            "Remove a package from the development dependencies."
+            " (<warning>Deprecated</warning>)"
+            " Use --group=dev instead.",
+        ),
         option(
             "dry-run",
             None,
             "Output the operations but do not execute anything "
             "(implicitly enables --verbose).",
         ),
+        option("lock", None, "Do not perform operations (only update the lockfile)."),
     ]
 
     help = """The <info>remove</info> command removes a package from the current
@@ -57,8 +64,9 @@ list of installed packages
             ]
 
             for group_name, section in [
-                (MAIN_GROUP, poetry_content["dependencies"])
-            ] + group_sections:
+                (MAIN_GROUP, poetry_content["dependencies"]),
+                *group_sections,
+            ]:
                 removed += self._remove_packages(packages, section, group_name)
                 if group_name != MAIN_GROUP:
                     if not section:
@@ -97,18 +105,16 @@ list of installed packages
             )
 
         # Refresh the locker
-        self.poetry.set_locker(
-            self.poetry.locker.__class__(self.poetry.locker.lock.path, poetry_content)
-        )
-        self._installer.set_locker(self.poetry.locker)
+        self.poetry.locker.set_local_config(poetry_content)
+        self.installer.set_locker(self.poetry.locker)
+        self.installer.set_package(self.poetry.package)
+        self.installer.dry_run(self.option("dry-run", False))
+        self.installer.verbose(self.io.is_verbose())
+        self.installer.update(True)
+        self.installer.execute_operations(not self.option("lock"))
+        self.installer.whitelist(removed_set)
 
-        self._installer.set_package(self.poetry.package)
-        self._installer.dry_run(self.option("dry-run", False))
-        self._installer.verbose(self.io.is_verbose())
-        self._installer.update(True)
-        self._installer.whitelist(removed_set)
-
-        status = self._installer.run()
+        status = self.installer.run()
 
         if not self.option("dry-run") and status == 0:
             assert isinstance(content, TOMLDocument)
